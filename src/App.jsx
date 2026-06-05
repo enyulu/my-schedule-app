@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useEffect, useRef } from 'react';
-import { Calendar, ChevronLeft, ChevronRight, Plus, X, Clock, AlertCircle, Download, RefreshCw, Cloud, Copy, Trash, Hourglass, FileSpreadsheet, Layers, Settings2, Undo, Database, AlignLeft, Sparkles, Bot, Maximize2, Minimize2, LogOut, Lock, Mail } from 'lucide-react';
+import { Calendar, ChevronLeft, ChevronRight, ChevronDown, Plus, X, Clock, AlertCircle, Download, RefreshCw, Cloud, Copy, Trash, Hourglass, FileSpreadsheet, Layers, Settings2, Undo, Database, AlignLeft, Sparkles, Bot, Maximize2, Minimize2, LogOut, Lock, Mail } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut } from 'firebase/auth';
 import { getFirestore, collection, doc, setDoc, deleteDoc, onSnapshot, updateDoc, arrayUnion, writeBatch, getDocs, getDoc } from 'firebase/firestore';
@@ -8,7 +8,6 @@ import { getFirestore, collection, doc, setDoc, deleteDoc, onSnapshot, updateDoc
 // ⚠️ 独立网站部署必填配置 (如果您要将其部署到自己的服务器/IP上)
 // 请前往 https://console.firebase.google.com/ 免费创建一个 Web 项目，并将配置粘贴在此：
 // ============================================================================
-
 const standaloneFirebaseConfig = {
   apiKey: "AIzaSyBVeGdLXbCb8VEO5VLw9j4GH9Ynqsvol3c",
   authDomain: "smart-schedule-8945f.firebaseapp.com",
@@ -1316,15 +1315,15 @@ export default function App() {
 
       {isModalOpen && (
         <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center z-[50] p-4 animate-in fade-in">
-          <div className="bg-white rounded-[32px] shadow-2xl w-full max-w-md border border-slate-100 font-sans flex flex-col max-h-[90vh]">
+          <div className="bg-white rounded-[32px] shadow-2xl w-full max-w-2xl border border-slate-100 font-sans flex flex-col max-h-[90vh]">
             <div className="flex items-center justify-between px-8 py-5 border-b border-slate-100 bg-slate-50/50 shrink-0">
-              <h2 className="text-xl font-black text-slate-800 font-sans">{editingCourseId ? '修改课程' : '添加课程'}</h2>
+              <h2 className="text-2xl font-black text-slate-800 font-sans tracking-tight">{editingCourseId ? '修改课程' : '添加课程'}</h2>
               <button onClick={() => setIsModalOpen(false)} className="p-2 hover:bg-slate-200 rounded-2xl text-slate-400 transition-all"><X size={20} /></button>
             </div>
             
-            <div className="p-8 space-y-6 text-sm overflow-y-auto">
+            <div className="p-8 space-y-6 text-[15px] overflow-y-auto">
               <div className="space-y-2">
-                <div className="flex justify-between items-center font-black text-slate-700">
+                <div className="flex justify-between items-center text-[15px] font-black text-slate-700">
                   <span>课程名称</span>
                   <button onClick={() => setIsNameManagerOpen(!isNameManagerOpen)} className={`text-[11px] flex items-center gap-1 transition-colors px-2 py-1 rounded-lg ${isNameManagerOpen ? 'bg-indigo-100 text-indigo-700' : 'text-indigo-500 hover:bg-slate-100'}`}>
                     <Settings2 size={12}/> {isNameManagerOpen ? '收起管理' : '管理列表'}
@@ -1342,7 +1341,7 @@ export default function App() {
                       setFormData({...formData, title: e.target.value});
                       setIsTitleDropdownOpen(true);
                     }} 
-                    className="w-full border-2 border-slate-100 rounded-2xl px-4 py-3 outline-none focus:border-indigo-500 font-bold transition-all" 
+                    className="w-full h-[52px] border-2 border-slate-100 rounded-2xl px-4 text-[15px] leading-none outline-none focus:border-indigo-500 font-bold transition-all bg-white" 
                     placeholder="输入或点击选取历史课程..." 
                     autoComplete="off"
                   />
@@ -1423,17 +1422,65 @@ export default function App() {
                 </div>
               </div>
               
-              <div className="grid grid-cols-2 gap-4 font-bold">
-                <div className="space-y-1.5">单价 (每小时)<input type="number" value={formData.value} onChange={e => setFormData({...formData, value: Number(e.target.value)})} className="w-full border-2 border-slate-100 rounded-2xl px-4 py-3 outline-none focus:border-indigo-500 mt-1" /></div>
-                <div className="space-y-1.5">课程时长<select value={formData.duration} onChange={e => setFormData({...formData, duration: Number(e.target.value)})} className="w-full border-2 border-slate-100 rounded-2xl px-4 py-3 outline-none bg-white mt-1 font-bold">{DURATION_OPTIONS.map(o=><option key={o.value} value={o.value}>{String(o.label)}</option>)}</select></div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-5 font-bold">
+                <div className="space-y-2">
+                  <label className="block text-[15px] font-black text-slate-700">单价 (每小时)</label>
+                  <div className="relative group">
+                    <div className="absolute left-3 top-1/2 -translate-y-1/2 w-9 h-9 rounded-xl bg-indigo-50 text-indigo-600 flex items-center justify-center font-black text-[18px] shadow-sm pointer-events-none group-focus-within:bg-indigo-100 transition-all">¥</div>
+                    <input
+                      type="number"
+                      value={formData.value}
+                      onChange={e => setFormData({...formData, value: Number(e.target.value)})}
+                      className="w-full h-12 border-2 border-slate-100 rounded-2xl pl-14 pr-4 text-[14px] font-black outline-none focus:border-indigo-500 focus:bg-white bg-slate-50/40 transition-all shadow-sm"
+                    />
+                  </div>
+                </div>
+                <div className="space-y-2">
+                  <label className="block text-[15px] font-black text-slate-700">课程时长</label>
+                  <div className="relative group">
+                    <div className="absolute left-3 top-1/2 -translate-y-1/2 w-9 h-9 rounded-xl bg-indigo-50 text-indigo-600 flex items-center justify-center shadow-sm pointer-events-none group-focus-within:bg-indigo-100 transition-all z-10"><Clock size={18} /></div>
+                    <select
+                      value={formData.duration}
+                      onChange={e => setFormData({...formData, duration: Number(e.target.value)})}
+                      className="w-full h-12 border-2 border-slate-100 rounded-2xl pl-16 pr-12 text-[14px] font-black outline-none focus:border-indigo-500 focus:bg-white bg-slate-50/40 transition-all shadow-sm appearance-none"
+                    >
+                      {DURATION_OPTIONS.map(o=><option key={o.value} value={o.value}>{String(o.label)}</option>)}
+                    </select>
+                    <div className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-500 pointer-events-none"><ChevronDown size={18} /></div>
+                  </div>
+                </div>
               </div>
               
-              <div className="grid grid-cols-2 gap-4 font-bold">
-                <div className="space-y-1.5">开始时间<input type="time" value={formData.startTime} onChange={e => setFormData({...formData, startTime: e.target.value})} className="w-full border-2 border-slate-100 rounded-2xl px-4 py-3 outline-none focus:border-indigo-500 mt-1" /></div>
-                <div className="space-y-1.5">所在星期<select value={formData.colIndex} onChange={e => setFormData({...formData, colIndex: Number(e.target.value)})} className="w-full border-2 border-slate-100 rounded-2xl px-4 py-3 outline-none bg-white mt-1 font-bold">{DAYS.map((d,i)=><option key={i} value={i}>{d}</option>)}</select></div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-5 font-bold">
+                <div className="space-y-2">
+                  <label className="block text-[15px] font-black text-slate-700">开始时间</label>
+                  <div className="relative group">
+                    <div className="absolute left-3 top-1/2 -translate-y-1/2 w-9 h-9 rounded-xl bg-indigo-50 text-indigo-600 flex items-center justify-center shadow-sm pointer-events-none group-focus-within:bg-indigo-100 transition-all"><Clock size={18} /></div>
+                    <input
+                      type="time"
+                      value={formData.startTime}
+                      onChange={e => setFormData({...formData, startTime: e.target.value})}
+                      className="w-full h-12 border-2 border-slate-100 rounded-2xl pl-14 pr-4 text-[14px] font-black outline-none focus:border-indigo-500 focus:bg-white bg-slate-50/40 transition-all shadow-sm"
+                    />
+                  </div>
+                </div>
+                <div className="space-y-2">
+                  <label className="block text-[15px] font-black text-slate-700">所在星期</label>
+                  <div className="relative group">
+                    <div className="absolute left-3 top-1/2 -translate-y-1/2 w-9 h-9 rounded-xl bg-indigo-50 text-indigo-600 flex items-center justify-center shadow-sm pointer-events-none group-focus-within:bg-indigo-100 transition-all z-10"><Calendar size={18} /></div>
+                    <select
+                      value={formData.colIndex}
+                      onChange={e => setFormData({...formData, colIndex: Number(e.target.value)})}
+                      className="w-full h-12 border-2 border-slate-100 rounded-2xl pl-16 pr-12 text-[14px] font-black outline-none focus:border-indigo-500 focus:bg-white bg-slate-50/40 transition-all shadow-sm appearance-none"
+                    >
+                      {DAYS.map((d,i)=><option key={i} value={i}>{d}</option>)}
+                    </select>
+                    <div className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-500 pointer-events-none"><ChevronDown size={18} /></div>
+                  </div>
+                </div>
               </div>
 
-              <div className="space-y-3 font-black text-slate-700">标签分类
+              <div className="space-y-3 text-[15px] font-black text-slate-700">标签分类
                 <div className="flex gap-4">{['A', 'B', 'P'].map(t => (
                   <label key={t} className="flex items-center gap-2 cursor-pointer p-2 rounded-xl hover:bg-slate-50 transition-all border border-transparent hover:border-slate-100">
                     <input type="radio" checked={formData.tag === t} onChange={() => {
@@ -1443,12 +1490,12 @@ export default function App() {
                       if (t === 'A') defaultVal = 240;
                       setFormData({...formData, tag: t, value: defaultVal});
                     }} className="w-4 h-4 text-indigo-600" />
-                    <span className={`px-3 py-1 rounded-lg text-[11px] font-black shadow-sm ${TAGS[t].badge}`}>{String(t)} 类别</span>
+                    <span className={`px-3 py-1.5 rounded-xl text-[12px] font-black shadow-sm ${TAGS[t].badge}`}>{String(t)} 类别</span>
                   </label>
                 ))}</div>
               </div>
               
-              <div className="space-y-3 pt-2 border-t border-slate-100 font-black text-slate-700">重复频率
+              <div className="space-y-3 pt-2 border-t border-slate-100 text-[15px] font-black text-slate-700">重复频率
                 <div className="grid grid-cols-3 gap-3 text-[12px]">
                   {[ {v:'weekly', l:'每周固定'}, {v:'biweekly', l:'隔周循环'}, {v:'temp', l:'仅限本周'} ].map(r=>(
                     <button key={r.v} onClick={()=>setFormData({...formData, recurrence: r.v})} className={`py-3 rounded-2xl font-black border-2 transition-all ${formData.recurrence===r.v ? 'bg-slate-800 border-slate-800 text-white shadow-lg':'bg-white border-slate-100 text-slate-400 hover:border-slate-200'}`}>{String(r.l)}</button>
@@ -1456,7 +1503,7 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="space-y-1.5 pt-2 border-t border-slate-100 font-bold text-slate-700">
+              <div className="space-y-2 pt-2 border-t border-slate-100 text-[15px] font-bold text-slate-700">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-1.5">
                     <AlignLeft size={14}/>

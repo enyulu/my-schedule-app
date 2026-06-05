@@ -1325,8 +1325,8 @@ export default function App() {
               <div className="space-y-2">
                 <div className="flex justify-between items-center text-[15px] font-black text-slate-700">
                   <span>课程名称</span>
-                  <button onClick={() => setIsNameManagerOpen(!isNameManagerOpen)} className={`text-[11px] flex items-center gap-1 transition-colors px-2 py-1 rounded-lg ${isNameManagerOpen ? 'bg-indigo-100 text-indigo-700' : 'text-indigo-500 hover:bg-slate-100'}`}>
-                    <Settings2 size={12}/> {isNameManagerOpen ? '收起管理' : '管理列表'}
+                  <button onClick={() => setIsNameManagerOpen(!isNameManagerOpen)} className={`text-[15px] font-black flex items-center gap-1.5 transition-colors px-2.5 py-1 rounded-xl ${isNameManagerOpen ? 'bg-indigo-100 text-indigo-700' : 'text-indigo-500 hover:bg-slate-100'}`}>
+                    <Settings2 size={16}/> {isNameManagerOpen ? '收起管理' : '管理列表'}
                   </button>
                 </div>
                 
@@ -1379,7 +1379,7 @@ export default function App() {
                   
                   {isNameManagerOpen && (
                     <div className="absolute top-full mt-2 left-0 right-0 bg-white border border-slate-200 rounded-2xl shadow-2xl z-[70] overflow-hidden animate-in slide-in-from-top-2">
-                      <div className="p-3 bg-slate-50 border-b border-slate-200 text-[10px] font-black text-slate-500">已保存的名称库（修改将全局生效）</div>
+                      <div className="p-3 bg-slate-50 border-b border-slate-200 text-[13px] font-black text-slate-500">已保存的名称库（修改将全局生效）</div>
                       <div className="max-h-[220px] overflow-y-auto">
                         {Array.from(new Set(courses.map(c=>c.title))).filter(n=>n).length > 0 ? (
                           Array.from(new Set(courses.map(c=>c.title))).filter(n=>n).map((name, i) => (
@@ -1391,23 +1391,23 @@ export default function App() {
                                     autoFocus
                                     value={editingNameState.newName}
                                     onChange={(e) => setEditingNameState({...editingNameState, newName: e.target.value})}
-                                    className="flex-1 border-2 border-indigo-200 rounded-lg px-2 py-1 text-[12px] font-bold outline-none focus:border-indigo-500"
+                                    className="flex-1 border-2 border-indigo-200 rounded-xl px-3 py-2 text-[15px] font-bold outline-none focus:border-indigo-500"
                                     onKeyDown={(e) => {
                                       if (e.key === 'Enter') handleBatchEditName(name, editingNameState.newName);
                                       if (e.key === 'Escape') setEditingNameState({oldName: null, newName: ''});
                                     }}
                                   />
                                   <div className="flex gap-1 shrink-0">
-                                    <button onClick={() => handleBatchEditName(name, editingNameState.newName)} className="px-2.5 py-1.5 rounded-lg text-[10px] font-black bg-emerald-500 text-white hover:bg-emerald-600 transition-all shadow-sm">保存</button>
-                                    <button onClick={() => setEditingNameState({oldName: null, newName: ''})} className="px-2.5 py-1.5 rounded-lg text-[10px] font-black bg-slate-100 text-slate-500 hover:bg-slate-200 transition-all">取消</button>
+                                    <button onClick={() => handleBatchEditName(name, editingNameState.newName)} className="px-3 py-2 rounded-xl text-[12px] font-black bg-emerald-500 text-white hover:bg-emerald-600 transition-all shadow-sm">保存</button>
+                                    <button onClick={() => setEditingNameState({oldName: null, newName: ''})} className="px-3 py-2 rounded-xl text-[12px] font-black bg-slate-100 text-slate-500 hover:bg-slate-200 transition-all">取消</button>
                                   </div>
                                 </div>
                               ) : (
                                 <>
-                                  <span className="font-bold text-slate-700 text-[12px] truncate pr-2 flex-1">{String(name)}</span>
+                                  <span className="font-bold text-slate-700 text-[15px] truncate pr-2 flex-1">{String(name)}</span>
                                   <div className="flex gap-1.5 shrink-0 opacity-100 transition-opacity">
-                                    <button onClick={() => setEditingNameState({oldName: name, newName: name})} className="px-3 py-1.5 rounded-xl text-[10px] font-black bg-slate-100 text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 transition-all">改名</button>
-                                    <button onClick={() => handleBatchDeleteName(name)} className={`px-3 py-1.5 rounded-xl text-[10px] font-black transition-all ${deleteConfirmTitle===name ? 'bg-red-500 text-white animate-pulse shadow-sm':'bg-slate-100 text-slate-400 hover:text-red-500 hover:bg-red-50'}`}>{deleteConfirmTitle===name ? '确认移除?' : '移除'}</button>
+                                    <button onClick={() => setEditingNameState({oldName: name, newName: name})} className="px-3 py-1.5 rounded-xl text-[12px] font-black bg-slate-100 text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 transition-all">改名</button>
+                                    <button onClick={() => handleBatchDeleteName(name)} className={`px-3 py-1.5 rounded-xl text-[12px] font-black transition-all ${deleteConfirmTitle===name ? 'bg-red-500 text-white animate-pulse shadow-sm':'bg-slate-100 text-slate-400 hover:text-red-500 hover:bg-red-50'}`}>{deleteConfirmTitle===name ? '确认移除?' : '移除'}</button>
                                   </div>
                                 </>
                               )}
@@ -1577,34 +1577,58 @@ export default function App() {
       {isExportModalOpen && (
         <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-md flex items-center justify-center z-[60] p-4">
           <div className="bg-white rounded-[32px] shadow-2xl w-full max-w-4xl overflow-hidden flex flex-col max-h-[85vh] border border-slate-100">
-            <div className="px-8 py-5 border-b border-slate-100 bg-slate-50/50 flex justify-between items-center shrink-0">
-              <h2 className="text-xl font-black text-slate-800 flex items-center gap-2 font-sans"><FileSpreadsheet size={20}/> 财务报表生成</h2>
+            <div className="px-8 py-5 border-b border-slate-100 bg-gradient-to-r from-slate-50 to-white flex justify-between items-center shrink-0">
+              <h2 className="text-xl font-black text-slate-800 flex items-center gap-2 font-sans"><span className="w-10 h-10 rounded-2xl bg-indigo-50 text-indigo-600 flex items-center justify-center"><FileSpreadsheet size={20}/></span> 财务报表生成</h2>
               <button onClick={() => setIsExportModalOpen(false)} className="p-2 hover:bg-slate-200 rounded-2xl text-slate-400 transition-all"><X size={20} /></button>
             </div>
-            <div className="p-8 border-b border-slate-100 shrink-0">
-              <div className="flex items-center gap-4 font-bold">
-                <div className="flex-1 space-y-1.5 text-slate-700">
-                  起始日期<input type="date" value={exportRange.start} onChange={e=>setExportRange({...exportRange, start: e.target.value})} className="w-full border-2 border-slate-100 rounded-2xl px-4 py-3 font-bold mt-1 outline-none focus:border-indigo-500 transition-colors" />
+            <div className="p-6 sm:p-8 border-b border-slate-100 shrink-0 bg-white">
+              <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-5 font-bold items-end">
+                <div className="space-y-2 text-slate-700">
+                  <label className="block text-[14px] font-black text-slate-700">起始日期</label>
+                  <div className="relative group">
+                    <div className="absolute left-3 top-1/2 -translate-y-1/2 w-9 h-9 rounded-xl bg-indigo-50 text-indigo-600 flex items-center justify-center shadow-sm pointer-events-none group-focus-within:bg-indigo-100 transition-all z-10"><Calendar size={17} /></div>
+                    <input
+                      type="date"
+                      value={exportRange.start}
+                      onChange={e=>setExportRange({...exportRange, start: e.target.value})}
+                      className="w-full h-12 border-2 border-slate-100 rounded-2xl pl-16 pr-4 text-[14px] font-black outline-none focus:border-indigo-500 focus:bg-white bg-slate-50/40 transition-all shadow-sm"
+                    />
+                  </div>
                 </div>
-                <div className="flex-1 space-y-1.5 text-slate-700">
-                  结束日期<input type="date" value={exportRange.end} onChange={e=>setExportRange({...exportRange, end: e.target.value})} className="w-full border-2 border-slate-100 rounded-2xl px-4 py-3 font-bold mt-1 outline-none focus:border-indigo-500 transition-colors" />
+                <div className="space-y-2 text-slate-700">
+                  <label className="block text-[14px] font-black text-slate-700">结束日期</label>
+                  <div className="relative group">
+                    <div className="absolute left-3 top-1/2 -translate-y-1/2 w-9 h-9 rounded-xl bg-indigo-50 text-indigo-600 flex items-center justify-center shadow-sm pointer-events-none group-focus-within:bg-indigo-100 transition-all z-10"><Calendar size={17} /></div>
+                    <input
+                      type="date"
+                      value={exportRange.end}
+                      onChange={e=>setExportRange({...exportRange, end: e.target.value})}
+                      className="w-full h-12 border-2 border-slate-100 rounded-2xl pl-16 pr-4 text-[14px] font-black outline-none focus:border-indigo-500 focus:bg-white bg-slate-50/40 transition-all shadow-sm"
+                    />
+                  </div>
                 </div>
-                <div className="flex-1 space-y-1.5 text-slate-700">
-                  筛选课程
-                  <select 
-                    value={exportCourseFilter} 
-                    onChange={e => setExportCourseFilter(e.target.value)} 
-                    className="w-full border-2 border-slate-100 rounded-2xl px-4 py-3 font-bold mt-1 outline-none focus:border-indigo-500 transition-colors bg-white cursor-pointer"
-                  >
-                    <option value="">全部课程 (默认)</option>
-                    {uniqueCourseNamesForExport.map(name => (
-                      <option key={name} value={name}>{name}</option>
-                    ))}
-                  </select>
+                <div className="space-y-2 text-slate-700">
+                  <label className="block text-[14px] font-black text-slate-700">筛选课程</label>
+                  <div className="relative group">
+                    <div className="absolute left-3 top-1/2 -translate-y-1/2 w-9 h-9 rounded-xl bg-indigo-50 text-indigo-600 flex items-center justify-center shadow-sm pointer-events-none group-focus-within:bg-indigo-100 transition-all z-10"><FileSpreadsheet size={17} /></div>
+                    <select 
+                      value={exportCourseFilter} 
+                      onChange={e => setExportCourseFilter(e.target.value)} 
+                      className="w-full h-12 border-2 border-slate-100 rounded-2xl pl-16 pr-12 text-[14px] font-black outline-none focus:border-indigo-500 focus:bg-white bg-slate-50/40 transition-all shadow-sm appearance-none cursor-pointer"
+                    >
+                      <option value="">全部课程</option>
+                      {uniqueCourseNamesForExport.map(name => (
+                        <option key={name} value={name}>{name}</option>
+                      ))}
+                    </select>
+                    <div className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-500 pointer-events-none"><ChevronDown size={18} /></div>
+                  </div>
                 </div>
-                <div className="flex-1 space-y-1.5 flex flex-col justify-end">
-                  <div className="h-[48px] bg-emerald-50 text-emerald-600 rounded-2xl flex items-center justify-center font-black text-lg gap-2 border border-emerald-200 shadow-sm">
-                    总累计 ¥ {exportResult ? exportResult.totalAll : 0}
+                <div className="space-y-2">
+                  <label className="block text-[14px] font-black text-transparent select-none">总计</label>
+                  <div className="h-12 bg-gradient-to-r from-emerald-50 to-teal-50 text-emerald-700 rounded-2xl flex items-center justify-center font-black text-[17px] gap-2 border border-emerald-200 shadow-sm whitespace-nowrap">
+                    <span className="text-[13px] text-emerald-600">总累计</span>
+                    <span>¥ {exportResult ? exportResult.totalAll : 0}</span>
                   </div>
                 </div>
               </div>

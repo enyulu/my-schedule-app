@@ -322,8 +322,6 @@ const replaceFirestoreSchedule = async (userId, rawCourses, source, targetWeekId
   }
 };
 
-const PLANNED_CS_COURSES = createDefaultSchedule().filter(c => c.id.startsWith('cs2026'));
-
 const getCourseTotalValue = (course, courseDate) => {
   if (!course || !course.startTime || !course.endTime) return 0;
   let durMins = timeToMinutes(course.endTime) - timeToMinutes(course.startTime);
@@ -561,8 +559,6 @@ export default function App() {
           return;
         }
 
-        const existingIds = new Set(list.map(c => c.id));
-        const missingPlannedCsCourses = PLANNED_CS_COURSES.filter(c => !existingIds.has(c.id));
         const requiresSchemaMigration = rawCourses.some(course =>
           !Object.hasOwn(course, 'name')
           || !Object.hasOwn(course, 'duration')
@@ -571,25 +567,21 @@ export default function App() {
           || !Object.hasOwn(course, 'category')
         );
 
-        if (missingPlannedCsCourses.length > 0 || requiresSchemaMigration) {
+        if (requiresSchemaMigration) {
           try {
             console.info('[schedule:init] repairing Firestore schedule structure', {
-              migrateExisting: requiresSchemaMigration,
-              missingPlannedCourses: missingPlannedCsCourses.length,
+              migrateExisting: true,
             });
             const batch = writeBatch(db);
-            if (requiresSchemaMigration) {
-              list.forEach(course => batch.set(doc(coursesRef, course.id), course));
-            }
-            missingPlannedCsCourses.forEach(c => batch.set(doc(coursesRef, c.id), c));
+            list.forEach(course => batch.set(doc(coursesRef, course.id), course));
             batch.set(doc(coursesRef, '_metadata_'), {
               last: Date.now(),
-              count: list.length + missingPlannedCsCourses.length,
+              count: list.length,
               schemaVersion: COURSE_SCHEMA_VERSION,
-              source: requiresSchemaMigration ? 'schema-migration' : 'planned-course-merge',
+              source: 'schema-migration',
             });
             await batch.commit();
-            setCourses([...list, ...missingPlannedCsCourses]);
+            setCourses(list);
           } catch (error) {
             logFirestoreError('init:schema-repair', error);
             setCourses(list);

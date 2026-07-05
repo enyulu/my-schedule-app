@@ -160,6 +160,8 @@ const INITIAL_COURSES = [
   { id: 'cs20260904', title: 'CS', colIndex: 4, startTime: '17:00', endTime: '18:30', value: 400, isFixed: true, weekId: null, baseWeekId: '2026-08-31', endWeekId: '2026-09-07', excludedWeeks: [], tag: 'P', notes: '' },
 ];
 
+const PLANNED_CS_COURSES = INITIAL_COURSES.filter(c => c.id.startsWith('cs2026'));
+
 const getCourseTotalValue = (course, courseDate) => {
   if (!course || !course.startTime || !course.endTime) return 0;
   let durMins = timeToMinutes(course.endTime) - timeToMinutes(course.startTime);
@@ -356,7 +358,23 @@ export default function App() {
         } catch (e) { console.error("Auto restore failed:", e); }
       } else {
         const list = docs.map(d => ({ id: d.id, ...d.data() }));
-        setCourses(list);
+        const existingIds = new Set(list.map(c => c.id));
+        const missingPlannedCsCourses = PLANNED_CS_COURSES.filter(c => !existingIds.has(c.id));
+
+        if (missingPlannedCsCourses.length > 0) {
+          try {
+            const batch = writeBatch(db);
+            missingPlannedCsCourses.forEach(c => batch.set(doc(coursesRef, c.id), c));
+            batch.set(doc(coursesRef, '_metadata_'), { last: Date.now() });
+            await batch.commit();
+            setCourses([...list, ...missingPlannedCsCourses]);
+          } catch (e) {
+            console.error("Planned CS merge failed:", e);
+            setCourses(list);
+          }
+        } else {
+          setCourses(list);
+        }
         setSyncing(false);
       }
     }, (err) => { 

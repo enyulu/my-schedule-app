@@ -1,5 +1,5 @@
-import React, { useState, useMemo, useEffect, useRef } from 'react';
-import { Calendar, ChevronLeft, ChevronRight, ChevronDown, Plus, X, Clock, AlertCircle, Download, RefreshCw, Cloud, Copy, Trash, Hourglass, FileSpreadsheet, Layers, Settings2, Undo, Database, AlignLeft, Sparkles, Bot, Maximize2, Minimize2, LogOut, Lock, Mail } from 'lucide-react';
+import { useState, useMemo, useEffect, useRef } from 'react';
+import { Calendar, ChevronLeft, ChevronRight, ChevronDown, Plus, X, Clock, AlertCircle, Download, RefreshCw, Cloud, Copy, FileSpreadsheet, Layers, Settings2, Undo, Database, AlignLeft, Sparkles, Bot, Maximize2, Minimize2, LogOut, Lock, Mail } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut } from 'firebase/auth';
 import { getFirestore, collection, doc, setDoc, deleteDoc, onSnapshot, updateDoc, arrayUnion, writeBatch, getDocs, getDoc } from 'firebase/firestore';
@@ -18,8 +18,9 @@ const standaloneFirebaseConfig = {
 };
 
 // 智能判断环境：如果在当前 AI 画布中，就用内置环境；如果部署在外部 IP 上，就用您自己的配置。
-const isStandalone = typeof __firebase_config === 'undefined';
-const firebaseConfig = isStandalone ? standaloneFirebaseConfig : JSON.parse(__firebase_config);
+const embeddedFirebaseConfig = globalThis.__firebase_config;
+const isStandalone = typeof embeddedFirebaseConfig === 'undefined';
+const firebaseConfig = isStandalone ? standaloneFirebaseConfig : JSON.parse(embeddedFirebaseConfig);
 
 const app = initializeApp(firebaseConfig);
 const auth = getAuth(app);
@@ -160,7 +161,168 @@ const INITIAL_COURSES = [
   { id: 'cs20260904', title: 'CS', colIndex: 4, startTime: '17:00', endTime: '18:30', value: 400, isFixed: true, weekId: null, baseWeekId: '2026-08-31', endWeekId: '2026-09-07', excludedWeeks: [], tag: 'P', notes: '' },
 ];
 
-const PLANNED_CS_COURSES = INITIAL_COURSES.filter(c => c.id.startsWith('cs2026'));
+const COURSE_SCHEMA_VERSION = 2;
+const COURSE_TIME_PATTERN = /^([01]\d|2[0-3]):([0-5]\d)$/;
+
+const normalizeCourse = (rawCourse, index, targetWeekId = currentWeekId) => {
+  if (!rawCourse || typeof rawCourse !== 'object' || Array.isArray(rawCourse)) {
+    throw new Error(`Course ${index + 1} is not an object`);
+  }
+
+  const id = String(rawCourse.id || `course-${index + 1}`).trim();
+  const name = String(rawCourse.name || rawCourse.title || '').trim();
+  const startTime = String(rawCourse.startTime || '').trim();
+  const weekday = Number(rawCourse.weekday ?? rawCourse.colIndex);
+  const categoryCandidate = String(rawCourse.category || rawCourse.tag || 'P').trim().toUpperCase();
+  const category = TAGS[categoryCandidate] ? categoryCandidate : 'P';
+
+  if (!id) throw new Error(`Course ${index + 1} has no id`);
+  if (!name) throw new Error(`Course ${id} has no name`);
+  if (!COURSE_TIME_PATTERN.test(startTime)) throw new Error(`Course ${id} has invalid startTime`);
+  if (!Number.isInteger(weekday) || weekday < 0 || weekday > 6) {
+    throw new Error(`Course ${id} has invalid weekday`);
+  }
+
+  let duration = Number(rawCourse.duration);
+  if (!Number.isFinite(duration) || duration <= 0) {
+    const endTime = String(rawCourse.endTime || '').trim();
+    if (!COURSE_TIME_PATTERN.test(endTime)) throw new Error(`Course ${id} has no valid duration or endTime`);
+    duration = timeToMinutes(endTime) - timeToMinutes(startTime);
+    if (duration <= 0) duration += 1440;
+  }
+  duration = Math.round(duration);
+  if (duration <= 0 || duration > 1440) throw new Error(`Course ${id} has invalid duration`);
+
+  const priceCandidate = rawCourse.price ?? rawCourse.value;
+  const price = priceCandidate === undefined || priceCandidate === null || priceCandidate === ''
+    ? 0
+    : Number(priceCandidate);
+  if (!Number.isFinite(price) || price < 0) throw new Error(`Course ${id} has invalid price`);
+
+  const isFixed = Boolean(rawCourse.isFixed);
+  const isBiweekly = Boolean(rawCourse.isBiweekly);
+  const normalized = {
+    id,
+    name,
+    title: name,
+    startTime,
+    duration,
+    endTime: minutesToTime(timeToMinutes(startTime) + duration),
+    weekday,
+    colIndex: weekday,
+    price,
+    value: price,
+    category,
+    tag: category,
+    isFixed,
+    isBiweekly,
+    weekId: isFixed ? null : String(rawCourse.weekId || targetWeekId),
+    excludedWeeks: Array.isArray(rawCourse.excludedWeeks)
+      ? rawCourse.excludedWeeks.filter(week => typeof week === 'string')
+      : [],
+    notes: typeof rawCourse.notes === 'string' ? rawCourse.notes : '',
+  };
+
+  if (isFixed && rawCourse.baseWeekId) normalized.baseWeekId = String(rawCourse.baseWeekId);
+  if (isFixed && rawCourse.endWeekId) normalized.endWeekId = String(rawCourse.endWeekId);
+  if (rawCourse.recurrence) normalized.recurrence = String(rawCourse.recurrence);
+
+  return normalized;
+};
+
+const normalizeCourseDataset = (rawData, source, targetWeekId = currentWeekId) => {
+  const input = Array.isArray(rawData) ? rawData : rawData?.courses;
+  if (!Array.isArray(input) || input.length === 0) {
+    throw new Error(`${source} did not contain a non-empty course array`);
+  }
+
+  const validCourses = [];
+  const validationErrors = [];
+  const ids = new Set();
+
+  input.forEach((rawCourse, index) => {
+    try {
+      const course = normalizeCourse(rawCourse, index, targetWeekId);
+      if (ids.has(course.id)) throw new Error(`Duplicate course id: ${course.id}`);
+      ids.add(course.id);
+      validCourses.push(course);
+    } catch (error) {
+      validationErrors.push(error.message);
+    }
+  });
+
+  if (validationErrors.length > 0) {
+    console.warn(`[schedule:${source}] rejected invalid courses`, validationErrors);
+  }
+  if (validCourses.length === 0) {
+    throw new Error(`${source} contained no valid courses`);
+  }
+
+  console.info(`[schedule:${source}] transform complete`, {
+    received: input.length,
+    valid: validCourses.length,
+    rejected: validationErrors.length,
+  });
+  return validCourses;
+};
+
+const createDefaultSchedule = (targetWeekId = currentWeekId) =>
+  normalizeCourseDataset(INITIAL_COURSES, 'local-seed', targetWeekId);
+
+const getCoursesRef = userId =>
+  collection(db, 'artifacts', FIXED_APP_ID, 'users', userId, 'courses');
+
+const logFirestoreError = (step, error) => {
+  const details = {
+    step,
+    code: error?.code || 'unknown',
+    message: error?.message || String(error),
+  };
+  if (error?.code === 'permission-denied' || error?.code === 'firestore/permission-denied') {
+    console.error(`[schedule:${step}] Firestore permission denied. Check security rules and the signed-in user path.`, details);
+  } else {
+    console.error(`[schedule:${step}] Firestore operation failed`, details);
+  }
+};
+
+const replaceFirestoreSchedule = async (userId, rawCourses, source, targetWeekId = currentWeekId) => {
+  console.info(`[schedule:${source}] write requested`, { userId });
+  const validatedCourses = normalizeCourseDataset(rawCourses, source, targetWeekId);
+  const coursesRef = getCoursesRef(userId);
+
+  try {
+    console.info(`[schedule:${source}] reading existing Firestore courses`);
+    const currentSnapshot = await getDocs(coursesRef);
+    console.info(`[schedule:${source}] existing Firestore read complete`, {
+      documents: currentSnapshot.size,
+    });
+
+    const batch = writeBatch(db);
+    currentSnapshot.forEach(snapshotDoc => batch.delete(snapshotDoc.ref));
+    validatedCourses.forEach(course => {
+      batch.set(doc(coursesRef, course.id), course);
+    });
+    batch.set(doc(coursesRef, '_metadata_'), {
+      last: Date.now(),
+      count: validatedCourses.length,
+      schemaVersion: COURSE_SCHEMA_VERSION,
+      source,
+    });
+
+    console.info(`[schedule:${source}] committing Firestore batch`, {
+      deletes: currentSnapshot.size,
+      writes: validatedCourses.length + 1,
+    });
+    await batch.commit();
+    console.info(`[schedule:${source}] Firestore write complete`);
+    return validatedCourses;
+  } catch (error) {
+    logFirestoreError(`${source}:write`, error);
+    throw error;
+  }
+};
+
+const PLANNED_CS_COURSES = createDefaultSchedule().filter(c => c.id.startsWith('cs2026'));
 
 const getCourseTotalValue = (course, courseDate) => {
   if (!course || !course.startTime || !course.endTime) return 0;
@@ -193,11 +355,11 @@ export default function App() {
   const gridBodyRef = useRef(null); 
   const appContainerRef = useRef(null);
   
-  const [courses, setCourses] = useState([]);
+  const [courses, setCourses] = useState(() => createDefaultSchedule(currentWeekId));
   const [viewWeekStart, setViewWeekStart] = useState(currentRealMonday);
   const [user, setUser] = useState(null);
   const [authInitialized, setAuthInitialized] = useState(false);
-  const [syncing, setSyncing] = useState(true);
+  const [syncing, setSyncing] = useState(false);
   const [overlapState, setOverlapState] = useState({});
   const [hideEmptyOverlay, setHideEmptyOverlay] = useState(false);
   
@@ -256,7 +418,7 @@ export default function App() {
           } else {
             setIsCssFullscreen(true);
           }
-        } catch (err) {
+        } catch {
           setIsCssFullscreen(true);
         }
       } else {
@@ -267,7 +429,9 @@ export default function App() {
         try {
           if (document.exitFullscreen) await document.exitFullscreen();
           else if (document.webkitExitFullscreen) await document.webkitExitFullscreen();
-        } catch (e) {}
+        } catch (error) {
+          console.warn('Unable to exit native fullscreen cleanly', error);
+        }
       }
       if (isCssFullscreen) {
         setIsCssFullscreen(false);
@@ -308,8 +472,9 @@ export default function App() {
   useEffect(() => {
     const initAuth = async () => {
       try {
-        if (!isStandalone && typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
-          await signInWithCustomToken(auth, __initial_auth_token); 
+        const initialAuthToken = globalThis.__initial_auth_token;
+        if (!isStandalone && initialAuthToken) {
+          await signInWithCustomToken(auth, initialAuthToken);
         } else if (!isStandalone) {
           await signInAnonymously(auth);
         }
@@ -326,50 +491,107 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!user) return;
-    const coursesRef = collection(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses');
+    if (!user) {
+      console.info('[schedule:init] no authenticated user; using local seed');
+      return;
+    }
+
+    const coursesRef = getCoursesRef(user.uid);
+    let repairInProgress = false;
+
     const unsubscribe = onSnapshot(coursesRef, async (snap) => {
+      console.info('[schedule:init] Firestore read complete', {
+        userId: user.uid,
+        documents: snap.size,
+      });
       const docs = snap.docs.filter(d => d.id !== '_metadata_');
       
-      if (docs.length === 0 && !hideEmptyOverlay) {
+      if (docs.length === 0) {
+        const localFallback = createDefaultSchedule(currentWeekId);
+        console.warn('[schedule:init] Firestore is empty; loading local seed immediately');
+        setCourses(localFallback);
+        setHideEmptyOverlay(true);
+        setSyncing(false);
+
+        if (repairInProgress) return;
+        repairInProgress = true;
+
         try {
           const templateRef = collection(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'saved_template');
+          console.info('[schedule:init] reading saved template');
           const tSnap = await getDocs(templateRef);
-          const batch = writeBatch(db);
           const currentWId = getWeekId(getMonday(new Date()));
-          
+
+          let restoreSource = 'local-seed';
+          let restoreCourses = localFallback;
           if (!tSnap.empty) {
-            tSnap.forEach(d => {
-              const data = d.data();
-              if (!data.isFixed) data.weekId = currentWId;
-              if (data.isBiweekly) data.baseWeekId = currentWId;
-              batch.set(doc(coursesRef, d.id), data);
-            });
+            console.info('[schedule:init] saved template found', { documents: tSnap.size });
+            const templateCourses = tSnap.docs.map(templateDoc => ({
+              id: templateDoc.id,
+              ...templateDoc.data(),
+            }));
+            restoreCourses = normalizeCourseDataset(templateCourses, 'saved-template', currentWId);
+            restoreSource = 'saved-template';
+            setCourses(restoreCourses);
           } else {
-            INITIAL_COURSES.forEach(c => {
-              const data = {...c};
-              if (!data.isFixed) data.weekId = currentWId;
-              if (data.isBiweekly) data.baseWeekId = currentWId;
-              batch.set(doc(coursesRef, data.id), data);
-            });
+            console.info('[schedule:init] no saved template found; using local seed');
           }
-          batch.set(doc(coursesRef, '_metadata_'), { last: Date.now() });
-          await batch.commit();
-        } catch (e) { console.error("Auto restore failed:", e); }
+
+          await replaceFirestoreSchedule(user.uid, restoreCourses, `auto-${restoreSource}`, currentWId);
+          setRestoreError('');
+        } catch (error) {
+          logFirestoreError('init:auto-restore', error);
+          console.warn('[schedule:init] cloud repair failed; local seed remains active');
+          setCourses(localFallback);
+        } finally {
+          repairInProgress = false;
+          setSyncing(false);
+        }
       } else {
-        const list = docs.map(d => ({ id: d.id, ...d.data() }));
+        let list;
+        let rawCourses;
+        try {
+          rawCourses = docs.map(d => ({ id: d.id, ...d.data() }));
+          list = normalizeCourseDataset(rawCourses, 'firestore-snapshot', currentWeekId);
+        } catch (error) {
+          console.error('[schedule:init] Firestore data was unusable; falling back to local seed', error);
+          setCourses(createDefaultSchedule(currentWeekId));
+          setHideEmptyOverlay(true);
+          setSyncing(false);
+          return;
+        }
+
         const existingIds = new Set(list.map(c => c.id));
         const missingPlannedCsCourses = PLANNED_CS_COURSES.filter(c => !existingIds.has(c.id));
+        const requiresSchemaMigration = rawCourses.some(course =>
+          !Object.hasOwn(course, 'name')
+          || !Object.hasOwn(course, 'duration')
+          || !Object.hasOwn(course, 'weekday')
+          || !Object.hasOwn(course, 'price')
+          || !Object.hasOwn(course, 'category')
+        );
 
-        if (missingPlannedCsCourses.length > 0) {
+        if (missingPlannedCsCourses.length > 0 || requiresSchemaMigration) {
           try {
+            console.info('[schedule:init] repairing Firestore schedule structure', {
+              migrateExisting: requiresSchemaMigration,
+              missingPlannedCourses: missingPlannedCsCourses.length,
+            });
             const batch = writeBatch(db);
+            if (requiresSchemaMigration) {
+              list.forEach(course => batch.set(doc(coursesRef, course.id), course));
+            }
             missingPlannedCsCourses.forEach(c => batch.set(doc(coursesRef, c.id), c));
-            batch.set(doc(coursesRef, '_metadata_'), { last: Date.now() });
+            batch.set(doc(coursesRef, '_metadata_'), {
+              last: Date.now(),
+              count: list.length + missingPlannedCsCourses.length,
+              schemaVersion: COURSE_SCHEMA_VERSION,
+              source: requiresSchemaMigration ? 'schema-migration' : 'planned-course-merge',
+            });
             await batch.commit();
             setCourses([...list, ...missingPlannedCsCourses]);
-          } catch (e) {
-            console.error("Planned CS merge failed:", e);
+          } catch (error) {
+            logFirestoreError('init:schema-repair', error);
             setCourses(list);
           }
         } else {
@@ -377,12 +599,15 @@ export default function App() {
         }
         setSyncing(false);
       }
-    }, (err) => { 
-      console.error(err);
+    }, (error) => {
+      logFirestoreError('init:snapshot-read', error);
+      console.warn('[schedule:init] Firestore listener failed; using local seed');
+      setCourses(createDefaultSchedule(currentWeekId));
+      setHideEmptyOverlay(true);
       setSyncing(false); 
     });
     return () => unsubscribe();
-  }, [user, hideEmptyOverlay]);
+  }, [user]);
 
   const coursesRefLatest = useRef(courses);
   useEffect(() => { coursesRefLatest.current = courses; }, [courses]);
@@ -583,7 +808,7 @@ export default function App() {
       const ci = cd.getDay() === 0 ? 6 : cd.getDay() - 1, wid = getWeekId(getMonday(cd));
       courses.forEach(c => {
         if (c.colIndex === ci) {
-          let active = false;
+          let active;
           if (c.isFixed) {
             const isAfterStart = c.baseWeekId ? wid >= c.baseWeekId : true;
             const isBeforeEnd = c.endWeekId ? wid < c.endWeekId : true;
@@ -706,16 +931,32 @@ export default function App() {
                setDragInfo(null); return; 
             }
             saveSnapshotForUndo(); setSyncing(true);
-            try { await updateDoc(doc(db, `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${course.id}`), { colIndex: colIdx, startTime: newStartTime, endTime: newEndTime });
-            } catch(err) { console.error(err); } finally { setSyncing(false); }
+            try {
+              await updateDoc(doc(db, `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${course.id}`), {
+                colIndex: colIdx,
+                weekday: colIdx,
+                startTime: newStartTime,
+                endTime: newEndTime,
+                duration: actualDur,
+              });
+            } catch (error) {
+              logFirestoreError('course:move', error);
+            } finally {
+              setSyncing(false);
+            }
          } else if (action === 'copy') {
             saveSnapshotForUndo(); setSyncing(true);
             try {
                const newId = Math.random().toString(36).substr(2, 9);
                const newData = { ...course, id: newId, colIndex: colIdx, startTime: newStartTime, endTime: newEndTime };
                if (!newData.isFixed) { newData.weekId = viewWeekId; delete newData.baseWeekId; } else { newData.weekId = null; newData.baseWeekId = viewWeekId; }
-               await setDoc(doc(db, `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${newId}`), newData);
-            } catch(err) { console.error(err); } finally { setSyncing(false); }
+               const validatedCopy = normalizeCourse(newData, 0, viewWeekId);
+               await setDoc(doc(db, `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${newId}`), validatedCopy);
+            } catch (error) {
+              logFirestoreError('course:copy', error);
+            } finally {
+              setSyncing(false);
+            }
          }
       }
       setDragInfo(null);
@@ -738,89 +979,187 @@ export default function App() {
         const newId = Math.random().toString(36).substr(2, 9);
         const tempCourse = { ...course, id: newId, colIndex: newColIdx, startTime: newStartTime, endTime: newEndTime, isFixed: false, isBiweekly: false, weekId: viewWeekId, recurrence: 'temp' };
         delete tempCourse.baseWeekId; delete tempCourse.excludedWeeks;
-        batch.set(doc(db, `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${newId}`), tempCourse);
+        batch.set(
+          doc(db, `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${newId}`),
+          normalizeCourse(tempCourse, 0, viewWeekId),
+        );
       } else if (type === 'permanent') {
-        batch.update(doc(db, `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${course.id}`), { colIndex: newColIdx, startTime: newStartTime, endTime: newEndTime });
+        let duration = timeToMinutes(newEndTime) - timeToMinutes(newStartTime);
+        if (duration <= 0) duration += 1440;
+        batch.update(doc(db, `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${course.id}`), {
+          colIndex: newColIdx,
+          weekday: newColIdx,
+          startTime: newStartTime,
+          endTime: newEndTime,
+          duration,
+        });
       }
       await batch.commit();
-    } catch (err) { console.error(err); } finally { setSyncing(false); setMoveConfirmInfo(null); }
+    } catch (error) {
+      logFirestoreError('course:confirm-move', error);
+    } finally {
+      setSyncing(false);
+      setMoveConfirmInfo(null);
+    }
   };
 
   const handleUpdateTemplate = async () => {
     if (!user || courses.length === 0) return;
     setIsSavingTemplate('saving');
     try {
+      console.info('[schedule:backup] validating current schedule');
+      const validatedCourses = normalizeCourseDataset(courses, 'backup-save', viewWeekId);
       const backupDocRef = doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'app_state', 'latest_backup');
-      await setDoc(backupDocRef, { code: JSON.stringify(courses), timestamp: Date.now() });
+      console.info('[schedule:backup] writing latest backup', {
+        courses: validatedCourses.length,
+      });
+      await setDoc(backupDocRef, {
+        code: JSON.stringify(validatedCourses),
+        courses: validatedCourses,
+        count: validatedCourses.length,
+        schemaVersion: COURSE_SCHEMA_VERSION,
+        timestamp: Date.now(),
+      });
+      console.info('[schedule:backup] latest backup write complete');
       setIsSavingTemplate('success');
       setTimeout(() => setIsSavingTemplate(false), 2000);
-    } catch (e) { console.error(e); setIsSavingTemplate(false); }
+    } catch (error) {
+      logFirestoreError('backup:write', error);
+      setIsSavingTemplate(false);
+    }
   };
 
-  const handleRestoreLatestBackup = async () => {
-    if (!user) return;
-    saveSnapshotForUndo(); setSyncing(true); setRestoreError("");
+  const restoreLatestSchedule = async () => {
+    const localFallback = createDefaultSchedule(viewWeekId);
+    saveSnapshotForUndo();
+    setSyncing(true);
+    setRestoreError('');
+
+    if (!user) {
+      console.warn('[schedule:restore] no authenticated user; using local seed');
+      setCourses(localFallback);
+      setHideEmptyOverlay(true);
+      setSyncing(false);
+      return;
+    }
+
     try {
+      console.info('[schedule:restore] reading latest backup', { userId: user.uid });
       const backupSnap = await getDoc(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'app_state', 'latest_backup'));
-      if (backupSnap.exists() && backupSnap.data().code) {
-        const parsed = JSON.parse(backupSnap.data().code);
-        const batch = writeBatch(db);
-        const coursesRef = collection(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses');
-        const currentSnap = await getDocs(coursesRef);
-        currentSnap.forEach(d => batch.delete(d.ref));
-        parsed.forEach(c => batch.set(doc(coursesRef, c.id), c));
-        batch.set(doc(coursesRef, '_metadata_'), { last: Date.now() });
-        await batch.commit();
-        setHideEmptyOverlay(true);
-      } else {
-        setRestoreError("云端未找到备份数据，请先尝试加载固定课表并保存一次。");
-        setTimeout(() => setRestoreError(""), 3000);
+      if (!backupSnap.exists()) throw new Error('Latest backup document does not exist');
+
+      const backupData = backupSnap.data();
+      console.info('[schedule:restore] backup read complete', {
+        hasCoursesArray: Array.isArray(backupData.courses),
+        hasLegacyCode: typeof backupData.code === 'string',
+      });
+
+      let rawCourses = backupData.courses;
+      if (!Array.isArray(rawCourses) && typeof backupData.code === 'string') {
+        console.info('[schedule:restore] parsing legacy backup code');
+        rawCourses = JSON.parse(backupData.code);
       }
-    } catch(e) { console.error(e); setRestoreError("恢复失败，备份数据可能已损坏。"); setTimeout(() => setRestoreError(""), 3000); } finally { setSyncing(false); }
+
+      const validatedCourses = normalizeCourseDataset(rawCourses, 'latest-backup', viewWeekId);
+      const restoredCourses = await replaceFirestoreSchedule(
+        user.uid,
+        validatedCourses,
+        'latest-backup',
+        viewWeekId,
+      );
+
+      setCourses(restoredCourses);
+      setHideEmptyOverlay(true);
+      setRestoreError('');
+      console.info('[schedule:restore] latest schedule restored successfully');
+    } catch (error) {
+      logFirestoreError('restore:latest-backup', error);
+      console.warn('[schedule:restore] latest backup unavailable; falling back to local seed');
+      setCourses(localFallback);
+      setHideEmptyOverlay(true);
+
+      try {
+        await replaceFirestoreSchedule(user.uid, localFallback, 'restore-local-fallback', viewWeekId);
+        console.info('[schedule:restore] local fallback also persisted to Firestore');
+      } catch (writeError) {
+        logFirestoreError('restore:local-fallback-write', writeError);
+        console.warn('[schedule:restore] local fallback remains active in memory only');
+      }
+
+      setRestoreError('云端备份不可用，已加载本地默认课表。');
+      setTimeout(() => setRestoreError(''), 4000);
+    } finally {
+      setSyncing(false);
+    }
   };
 
   const restoreInitialData = async () => {
-    if (!user) return;
-    saveSnapshotForUndo(); setSyncing(true);
-    try {
-      const batch = writeBatch(db);
-      const coursesRef = collection(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses');
-      const currentSnap = await getDocs(coursesRef);
-      currentSnap.forEach(d => batch.delete(d.ref));
-      INITIAL_COURSES.forEach(c => {
-        const data = {...c};
-        if (!data.isFixed) data.weekId = viewWeekId;
-        if (data.isBiweekly) data.baseWeekId = viewWeekId;
-        batch.set(doc(coursesRef, data.id), data);
-      });
-      batch.set(doc(coursesRef, '_metadata_'), { last: Date.now() });
-      await batch.commit();
+    const localSeed = createDefaultSchedule(viewWeekId);
+    saveSnapshotForUndo();
+    setSyncing(true);
+    setRestoreError('');
+
+    if (!user) {
+      console.warn('[schedule:initialize] no authenticated user; using local seed');
+      setCourses(localSeed);
       setHideEmptyOverlay(true);
-    } catch (e) { console.error(e); } finally { setSyncing(false); }
+      setSyncing(false);
+      return;
+    }
+
+    try {
+      console.info('[schedule:initialize] restoring local seed');
+      const initializedCourses = await replaceFirestoreSchedule(
+        user.uid,
+        localSeed,
+        'manual-local-seed',
+        viewWeekId,
+      );
+      setCourses(initializedCourses);
+      setHideEmptyOverlay(true);
+      console.info('[schedule:initialize] local seed initialization complete');
+    } catch (error) {
+      logFirestoreError('initialize:local-seed', error);
+      console.warn('[schedule:initialize] Firestore write failed; local seed remains active');
+      setCourses(localSeed);
+      setHideEmptyOverlay(true);
+      setRestoreError('云端写入失败，已在本地加载默认课表。');
+      setTimeout(() => setRestoreError(''), 4000);
+    } finally {
+      setSyncing(false);
+    }
   };
 
   const handleCopyBackup = () => {
     try {
       const textArea = document.createElement("textarea"); textArea.value = backupText; document.body.appendChild(textArea); textArea.select(); document.execCommand("copy"); document.body.removeChild(textArea);
       setBackupStatus('✅ 代码已成功复制到剪贴板'); setTimeout(() => setBackupStatus(''), 3000);
-    } catch (err) { setBackupStatus('❌ 复制失败，请手动全选复制'); }
+    } catch { setBackupStatus('❌ 复制失败，请手动全选复制'); }
   };
 
   const handleImportBackup = async () => {
     if (!backupText.trim() || !user) { setBackupStatus('❌ 请先粘贴代码'); return; }
     try {
-      const parsed = JSON.parse(backupText); if (!Array.isArray(parsed)) throw new Error('Invalid format');
-      saveSnapshotForUndo(); setSyncing(true);
-      const batch = writeBatch(db);
-      const coursesRef = collection(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses');
-      const snap = await getDocs(coursesRef);
-      snap.forEach(d => batch.delete(d.ref));
-      parsed.forEach(c => batch.set(doc(coursesRef, c.id), c));
-      batch.set(doc(coursesRef, '_metadata_'), { last: Date.now() });
-      await batch.commit();
+      console.info('[schedule:manual-import] parsing backup text');
+      const parsed = JSON.parse(backupText);
+      const validatedCourses = normalizeCourseDataset(parsed, 'manual-import', viewWeekId);
+      saveSnapshotForUndo();
+      setSyncing(true);
+      const restoredCourses = await replaceFirestoreSchedule(
+        user.uid,
+        validatedCourses,
+        'manual-import',
+        viewWeekId,
+      );
+      setCourses(restoredCourses);
       setBackupStatus('✅ 数据已成功恢复！');
       setTimeout(() => { setIsBackupModalOpen(false); setBackupStatus(''); setHideEmptyOverlay(true); }, 1500);
-    } catch (e) { setBackupStatus('❌ 代码格式错误'); } finally { setSyncing(false); }
+    } catch (error) {
+      logFirestoreError('manual-import', error);
+      setBackupStatus(`❌ 恢复失败：${error.message}`);
+    } finally {
+      setSyncing(false);
+    }
   };
 
   const handleAIAnalysis = async () => {
@@ -833,7 +1172,7 @@ export default function App() {
       const prompt = `你是一个专业的教务排课分析助手。以下是我本周的课表安排：\n${courseSummary || '本周暂无课程'}\n请根据上述课表，用简短、专业的语气分析我的排课强度、收入分布，并给出合理的建议。`;
       const result = await callGeminiAPI(prompt);
       setScheduleAnalysisResult(result);
-    } catch (e) { setScheduleAnalysisResult("分析失败，请检查网络连接。"); } finally { setIsAnalyzingSchedule(false); }
+    } catch { setScheduleAnalysisResult("分析失败，请检查网络连接。"); } finally { setIsAnalyzingSchedule(false); }
   };
 
   const handleAIGenerateNote = async () => {
@@ -845,7 +1184,7 @@ export default function App() {
     } catch (e) { console.error(e); } finally { setIsGeneratingNote(false); }
   };
 
-  const openModal = (course = null, colIdx = 0, defaultStartTime = '10:00') => {
+  function openModal(course = null, colIdx = 0, defaultStartTime = '10:00') {
     setIsNameManagerOpen(false); setIsTitleDropdownOpen(false); setDeleteConfirmTitle(null);
     if (course) {
       let dur = timeToMinutes(course.endTime) - timeToMinutes(course.startTime); if (dur < 0) dur += 1440;
@@ -854,7 +1193,7 @@ export default function App() {
       setEditingCourseId(null); setFormData({ title: '', colIndex: colIdx, startTime: defaultStartTime, duration: 60, value: 400, recurrence: 'temp', excludedWeeks: [], tag: 'P', notes: '' });
     }
     setIsModalOpen(true);
-  };
+  }
 
   const handleSave = async (isDuplicate = false) => {
     if (!formData.title.trim() || !user) return;
@@ -866,18 +1205,36 @@ export default function App() {
     data.isFixed = data.recurrence !== 'temp'; data.isBiweekly = data.recurrence === 'biweekly';
     if (data.isFixed) data.baseWeekId = (isDuplicate ? viewWeekId : (original?.baseWeekId || viewWeekId)); else delete data.baseWeekId;
     data.weekId = data.isFixed ? null : (isDuplicate ? viewWeekId : (original && !original.isFixed ? original.weekId : viewWeekId));
-    if (isDuplicate) data.excludedWeeks = []; delete data.duration; delete data.recurrence;
-    
-    await setDoc(doc(db, `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${targetId}`), data);
-    
-    const sync = [];
-    courses.forEach(c => { 
-      if (c.title === formData.title && c.id !== targetId && (c.value !== formData.value || c.tag !== formData.tag)) {
-        sync.push(updateDoc(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', c.id), { value: formData.value, tag: formData.tag })); 
-      }
-    });
-    if (sync.length) await Promise.all(sync);
-    setIsModalOpen(false);
+    if (isDuplicate) data.excludedWeeks = [];
+
+    try {
+      const validatedCourse = normalizeCourse(data, 0, viewWeekId);
+      console.info('[schedule:course-save] writing validated course', {
+        id: targetId,
+        name: validatedCourse.name,
+      });
+      await setDoc(doc(db, `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${targetId}`), validatedCourse);
+
+      const sync = [];
+      courses.forEach(c => {
+        if (c.title === formData.title && c.id !== targetId && (c.value !== formData.value || c.tag !== formData.tag)) {
+          sync.push(updateDoc(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', c.id), {
+            value: validatedCourse.price,
+            price: validatedCourse.price,
+            tag: validatedCourse.category,
+            category: validatedCourse.category,
+          }));
+        }
+      });
+      if (sync.length) await Promise.all(sync);
+      setIsModalOpen(false);
+    } catch (error) {
+      logFirestoreError('course:save', error);
+      setRestoreError(`课程保存失败：${error.message}`);
+      setTimeout(() => setRestoreError(''), 4000);
+    } finally {
+      setSyncing(false);
+    }
   };
 
   const performDelete = async (id, force = false) => {
@@ -926,7 +1283,12 @@ export default function App() {
     try {
       const batch = writeBatch(db);
       const snap = await getDocs(collection(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses'));
-      snap.forEach(d => { if (d.data().title === oldName) batch.update(d.ref, { title: finalNewName }); });
+      snap.forEach(d => {
+        if (d.data().title === oldName) batch.update(d.ref, {
+          title: finalNewName,
+          name: finalNewName,
+        });
+      });
       await batch.commit(); setEditingNameState({ oldName: null, newName: '' });
       if (formData.title === oldName) setFormData({ ...formData, title: finalNewName });
     } catch (e) { console.error(e); } finally { setSyncing(false); }
@@ -1087,7 +1449,7 @@ export default function App() {
               <button onClick={() => { setBackupText(JSON.stringify(coursesRefLatest.current, null, 2)); setBackupStatus(""); setIsBackupModalOpen(true); }} className="px-3 py-1.5 bg-white text-slate-600 border border-slate-200 rounded-md font-bold shadow-sm hover:bg-slate-50 transition-all flex items-center gap-1">
                 <Database size={14} /> 手动备份代码
               </button>
-              <button onClick={handleRestoreLatestBackup} className="px-3 py-1.5 bg-white text-indigo-600 border border-indigo-100 rounded-md font-bold shadow-sm hover:bg-indigo-50 transition-all flex items-center gap-1">
+              <button onClick={restoreLatestSchedule} className="px-3 py-1.5 bg-white text-indigo-600 border border-indigo-100 rounded-md font-bold shadow-sm hover:bg-indigo-50 transition-all flex items-center gap-1">
                 <RefreshCw size={14} /> 从云端恢复备份
               </button>
               <button onClick={handleUpdateTemplate} disabled={!!isSavingTemplate || courses.length === 0} className={`px-4 py-1.5 rounded-md font-bold shadow-sm transition-all flex items-center gap-1 border ${courses.length > 0 ? 'bg-emerald-50 text-emerald-600 border-emerald-200 hover:bg-emerald-100' : 'bg-slate-50 text-slate-300 border-slate-100 cursor-not-allowed'}`}>
@@ -1112,7 +1474,7 @@ export default function App() {
               </p>
 
               <div className="w-full flex flex-col gap-3">
-                <button onClick={handleRestoreLatestBackup} className="w-full py-4 bg-indigo-600 text-white font-black rounded-2xl hover:bg-indigo-700 shadow-lg shadow-indigo-200 transition-all flex items-center justify-center gap-2">
+                <button onClick={restoreLatestSchedule} className="w-full py-4 bg-indigo-600 text-white font-black rounded-2xl hover:bg-indigo-700 shadow-lg shadow-indigo-200 transition-all flex items-center justify-center gap-2">
                   <Cloud size={18} /> 1. 选择最新课表数据 (推荐)
                 </button>
                 <button onClick={restoreInitialData} className="w-full py-4 bg-emerald-500 text-white font-black rounded-2xl hover:bg-emerald-600 shadow-lg shadow-emerald-200 transition-all flex items-center justify-center gap-2">

@@ -83,6 +83,25 @@ const getDiffWeeks = (w1, w2) => {
   return Math.round(Math.abs(date2 - date1) / 604800000);
 };
 
+const getNextWeekId = (weekId) => {
+  const [year, month, day] = weekId.split('-').map(Number);
+  const nextWeek = new Date(year, month - 1, day);
+  nextWeek.setDate(nextWeek.getDate() + 7);
+  return getWeekId(nextWeek);
+};
+
+const getOccurrenceKey = (weekId, course) => [
+  weekId,
+  String(course.colIndex).padStart(2, '0'),
+  course.startTime,
+].join('|');
+
+const getLessonAnchorKey = (anchor) => [
+  anchor.weekId,
+  String(anchor.colIndex ?? -1).padStart(2, '0'),
+  anchor.startTime || '00:00',
+].join('|');
+
 const isCourseVisibleInWeek = (course, weekId) => {
   if (course.isFixed) {
     const isAfterStart = course.baseWeekId ? weekId >= course.baseWeekId : true;
@@ -93,12 +112,6 @@ const isCourseVisibleInWeek = (course, weekId) => {
       && (!course.isBiweekly || getDiffWeeks(course.baseWeekId, weekId) % 2 === 0);
   }
   return course.weekId === weekId;
-};
-
-const getCourseDurationHours = (course) => {
-  let durationMinutes = timeToMinutes(course.endTime) - timeToMinutes(course.startTime);
-  if (durationMinutes < 0) durationMinutes += 1440;
-  return durationMinutes / 60;
 };
 
 // --- Gemini API 集成逻辑 ---
@@ -179,7 +192,7 @@ const INITIAL_COURSES = [
   { id: 'cs20260904', title: 'CS', colIndex: 4, startTime: '17:00', endTime: '18:30', value: 400, isFixed: true, weekId: null, baseWeekId: '2026-08-31', endWeekId: '2026-09-07', excludedWeeks: [], tag: 'P', notes: '' },
 ];
 
-const COURSE_SCHEMA_VERSION = 3;
+const COURSE_SCHEMA_VERSION = 4;
 const COURSE_TIME_PATTERN = /^([01]\d|2[0-3]):([0-5]\d)$/;
 
 const getLegacyLessonTrackingDefaults = (name) => {
@@ -239,6 +252,25 @@ const normalizeCourse = (rawCourse, index, targetWeekId = currentWeekId) => {
       : legacyLessonTracking.cycleStarts)
       .filter(week => typeof week === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(week))
   )).sort();
+  const rawLessonAnchors = Array.isArray(rawCourse.lessonTrackingAnchors)
+    ? rawCourse.lessonTrackingAnchors
+    : lessonCycleStarts.map(weekId => ({
+        weekId,
+        colIndex: -1,
+        startTime: '00:00',
+        courseId: '',
+        lessonNumber: 0,
+      }));
+  const lessonTrackingAnchors = rawLessonAnchors
+    .filter(anchor => anchor && typeof anchor === 'object' && /^\d{4}-\d{2}-\d{2}$/.test(anchor.weekId || ''))
+    .map(anchor => ({
+      weekId: anchor.weekId,
+      colIndex: Number.isInteger(Number(anchor.colIndex)) ? Number(anchor.colIndex) : -1,
+      startTime: COURSE_TIME_PATTERN.test(anchor.startTime || '') ? anchor.startTime : '00:00',
+      courseId: typeof anchor.courseId === 'string' ? anchor.courseId : '',
+      lessonNumber: Math.max(0, Math.round(Number(anchor.lessonNumber) || 0)),
+    }))
+    .sort((a, b) => getLessonAnchorKey(a).localeCompare(getLessonAnchorKey(b)));
   const normalized = {
     id,
     name,
@@ -260,12 +292,14 @@ const normalizeCourse = (rawCourse, index, targetWeekId = currentWeekId) => {
       : [],
     lessonTrackingEnabled,
     lessonCycleStarts,
+    lessonTrackingAnchors,
     notes: typeof rawCourse.notes === 'string' ? rawCourse.notes : '',
   };
 
   if (isFixed && rawCourse.baseWeekId) normalized.baseWeekId = String(rawCourse.baseWeekId);
   if (isFixed && rawCourse.endWeekId) normalized.endWeekId = String(rawCourse.endWeekId);
   if (typeof rawCourse.priceEffectiveWeek === 'string') normalized.priceEffectiveWeek = rawCourse.priceEffectiveWeek;
+  if (typeof rawCourse.priceEffectiveOccurrence === 'string') normalized.priceEffectiveOccurrence = rawCourse.priceEffectiveOccurrence;
   if (rawCourse.recurrence) normalized.recurrence = String(rawCourse.recurrence);
 
   return normalized;
@@ -414,6 +448,9 @@ export default function App() {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editingCourseId, setEditingCourseId] = useState(null);
   const [formData, setFormData] = useState({ title: '', colIndex: 0, startTime: '10:00', duration: 60, value: 0, recurrence: 'temp', excludedWeeks: [], tag: 'P', notes: '' });
+  const [isLessonSettingsModalOpen, setIsLessonSettingsModalOpen] = useState(false);
+  const [lessonSettingsDraft, setLessonSettingsDraft] = useState({ enabled: false, lessonNumber: 1 });
+  const [lessonSettingsStatus, setLessonSettingsStatus] = useState('');
   const [isNameManagerOpen, setIsNameManagerOpen] = useState(false);
   const [deleteConfirmTitle, setDeleteConfirmTitle] = useState(null);
   const [isTitleDropdownOpen, setIsTitleDropdownOpen] = useState(false); 
@@ -652,7 +689,7 @@ export default function App() {
       if (!course.title) return;
       const existing = settings.get(course.title) || {
         enabled: false,
-        cycleStarts: new Set(),
+        anchors: new Map(),
         settingWeek: '',
       };
       const settingWeek = course.baseWeekId || course.weekId || '';
@@ -660,11 +697,45 @@ export default function App() {
         existing.enabled = Boolean(course.lessonTrackingEnabled);
         existing.settingWeek = settingWeek;
       }
-      (course.lessonCycleStarts || []).forEach(week => existing.cycleStarts.add(week));
+      (course.lessonTrackingAnchors || []).forEach(anchor => {
+        existing.anchors.set(getLessonAnchorKey(anchor), anchor);
+      });
       settings.set(course.title, existing);
     });
     return settings;
   }, [courses]);
+
+  const getCourseLessonNumber = useCallback((course, currentWeek, includeDisabled = false) => {
+    const trackingSettings = lessonSettingsByTitle.get(course.title);
+    if (!trackingSettings || (!trackingSettings.enabled && !includeDisabled)) return null;
+
+    const targetKey = getOccurrenceKey(currentWeek, course);
+    const anchorEntries = Array.from(trackingSettings.anchors.entries())
+      .filter(([key]) => key <= targetKey)
+      .sort(([keyA], [keyB]) => keyA.localeCompare(keyB));
+    const latestAnchorEntry = anchorEntries.at(-1);
+    if (!latestAnchorEntry) return null;
+
+    const [anchorKey, anchor] = latestAnchorEntry;
+    let lessonNumber = Number(anchor.lessonNumber) || 0;
+    let iterWeekId = anchor.weekId;
+    let safety = 0;
+
+    while (iterWeekId <= currentWeek && safety < 1000) {
+      safety += 1;
+      const weekCourses = courses
+        .filter(candidate => candidate.title === course.title && isCourseVisibleInWeek(candidate, iterWeekId))
+        .sort((a, b) => getOccurrenceKey(iterWeekId, a).localeCompare(getOccurrenceKey(iterWeekId, b)));
+
+      weekCourses.forEach(candidate => {
+        const occurrenceKey = getOccurrenceKey(iterWeekId, candidate);
+        if (occurrenceKey > anchorKey && occurrenceKey <= targetKey) lessonNumber += 1;
+      });
+      iterWeekId = getNextWeekId(iterWeekId);
+    }
+
+    return lessonNumber > 0 ? lessonNumber : null;
+  }, [courses, lessonSettingsByTitle]);
 
   const getCourseDisplayInfo = useCallback((course, currentWeek) => {
     const baseTitle = course.title ? course.title.replace(/\s*\(第\d+课\)/g, '') : '';
@@ -672,39 +743,8 @@ export default function App() {
     const [y, m, d] = currentWeek.split('-').map(Number);
     const targetMon = new Date(y, m - 1, d);
 
-    const trackingSettings = lessonSettingsByTitle.get(course.title);
-    const cycleStart = trackingSettings?.enabled
-      ? Array.from(trackingSettings.cycleStarts).filter(week => week <= currentWeek).sort().at(-1)
-      : null;
-
-    if (cycleStart) {
-      const [startYear, startMonth, startDay] = cycleStart.split('-').map(Number);
-      const iter = new Date(startYear, startMonth - 1, startDay);
-      let lessonCount = 0;
-      let safety = 0;
-
-      while (iter <= targetMon && safety < 1000) {
-        safety += 1;
-        const iterWeekId = getWeekId(iter);
-        const weekCourses = courses
-          .filter(candidate => candidate.title === course.title && isCourseVisibleInWeek(candidate, iterWeekId))
-          .sort((a, b) => a.colIndex !== b.colIndex
-            ? a.colIndex - b.colIndex
-            : timeToMinutes(a.startTime) - timeToMinutes(b.startTime));
-
-        for (const candidate of weekCourses) {
-          lessonCount += getCourseDurationHours(candidate);
-          if (iterWeekId === currentWeek && candidate.id === course.id) break;
-        }
-        if (iterWeekId === currentWeek) break;
-        iter.setDate(iter.getDate() + 7);
-      }
-
-      if (lessonCount > 0) {
-        const formattedCount = Number.isInteger(lessonCount) ? lessonCount : lessonCount.toFixed(1);
-        dynamicNote = `第${formattedCount}课时`;
-      }
-    }
+    const lessonNumber = getCourseLessonNumber(course, currentWeek);
+    if (lessonNumber) dynamicNote = `第${lessonNumber}课时`;
 
     if (course.title && course.title.includes('芮彤')) {
       let totalMins = 0, safety = 0;
@@ -744,7 +784,7 @@ export default function App() {
     }
 
     return { title: baseTitle, dynamicNote };
-  }, [courses, lessonSettingsByTitle]);
+  }, [courses, getCourseLessonNumber]);
 
   const visibleCourses = useMemo(
     () => courses.filter(course => isCourseVisibleInWeek(course, viewWeekId)),
@@ -1193,7 +1233,7 @@ export default function App() {
       let dur = timeToMinutes(course.endTime) - timeToMinutes(course.startTime); if (dur < 0) dur += 1440;
       setEditingCourseId(course.id); setFormData({ ...course, duration: dur, recurrence: course.isBiweekly ? 'biweekly' : (course.isFixed ? 'weekly' : 'temp'), notes: course.notes || '' });
     } else {
-      setEditingCourseId(null); setFormData({ title: '', colIndex: colIdx, startTime: defaultStartTime, duration: 60, value: 400, recurrence: 'temp', excludedWeeks: [], lessonTrackingEnabled: false, lessonCycleStarts: [], tag: 'P', notes: '' });
+      setEditingCourseId(null); setFormData({ title: '', colIndex: colIdx, startTime: defaultStartTime, duration: 60, value: 400, recurrence: 'temp', excludedWeeks: [], lessonTrackingEnabled: false, lessonCycleStarts: [], lessonTrackingAnchors: [], tag: 'P', notes: '' });
     }
     setIsModalOpen(true);
   }
@@ -1207,10 +1247,23 @@ export default function App() {
     data.price = Number(formData.value);
     data.category = formData.tag;
     const learnerLessonSettings = lessonSettingsByTitle.get(formData.title.trim());
-    if (learnerLessonSettings) {
-      data.lessonTrackingEnabled = learnerLessonSettings.enabled;
-      data.lessonCycleStarts = Array.from(learnerLessonSettings.cycleStarts).sort();
+    const nextLessonEnabled = typeof formData.pendingLessonTrackingEnabled === 'boolean'
+      ? formData.pendingLessonTrackingEnabled
+      : Boolean(learnerLessonSettings?.enabled);
+    const lessonAnchorMap = new Map(learnerLessonSettings?.anchors || []);
+    if (nextLessonEnabled && formData.pendingLessonNumber) {
+      const pendingAnchor = {
+        weekId: viewWeekId,
+        colIndex: data.colIndex,
+        startTime: data.startTime,
+        courseId: targetId,
+        lessonNumber: Math.max(1, Math.round(Number(formData.pendingLessonNumber) || 1)),
+      };
+      lessonAnchorMap.set(getLessonAnchorKey(pendingAnchor), pendingAnchor);
     }
+    data.lessonTrackingEnabled = nextLessonEnabled;
+    data.lessonTrackingAnchors = Array.from(lessonAnchorMap.values())
+      .sort((a, b) => getLessonAnchorKey(a).localeCompare(getLessonAnchorKey(b)));
     
     data.isFixed = data.recurrence !== 'temp'; data.isBiweekly = data.recurrence === 'biweekly';
     if (data.isFixed) data.baseWeekId = (isDuplicate ? viewWeekId : (original?.baseWeekId || viewWeekId)); else delete data.baseWeekId;
@@ -1219,40 +1272,103 @@ export default function App() {
 
     try {
       const priceChanged = original && Number(original.value) !== Number(data.value);
-      if (isDuplicate || !original || priceChanged) data.priceEffectiveWeek = viewWeekId;
-      const shouldSplitPriceHistory = !isDuplicate
-        && original?.isFixed
-        && data.isFixed
-        && priceChanged
-        && (!original.baseWeekId || original.baseWeekId < viewWeekId);
+      const priceEffectiveOccurrence = original ? getOccurrenceKey(viewWeekId, original) : getOccurrenceKey(viewWeekId, data);
+      if (isDuplicate || !original || priceChanged) {
+        data.priceEffectiveWeek = viewWeekId;
+        data.priceEffectiveOccurrence = priceEffectiveOccurrence;
+      }
+      const shouldApplyPriceFromCurrentCourse = !isDuplicate
+        && original
+        && original.title === data.title.trim()
+        && priceChanged;
 
-      if (shouldSplitPriceHistory) {
-        const newCourseId = Math.random().toString(36).substr(2, 9);
-        const futureCourse = {
-          ...data,
-          id: newCourseId,
-          baseWeekId: viewWeekId,
-          priceEffectiveWeek: viewWeekId,
-          excludedWeeks: (original.excludedWeeks || []).filter(week => week >= viewWeekId),
-        };
-        if (original.endWeekId) futureCourse.endWeekId = original.endWeekId;
-        else delete futureCourse.endWeekId;
-
-        const validatedFutureCourse = normalizeCourse(futureCourse, 0, viewWeekId);
+      if (shouldApplyPriceFromCurrentCourse) {
         const batch = writeBatch(db);
-        batch.update(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', original.id), {
-          endWeekId: viewWeekId,
-          excludedWeeks: (original.excludedWeeks || []).filter(week => week < viewWeekId),
+        const sameTitleCourses = courses.filter(course => course.title === original.title);
+
+        sameTitleCourses.forEach(course => {
+          if (!course.isFixed) {
+            const occurrenceKey = getOccurrenceKey(course.weekId, course);
+            if (occurrenceKey < priceEffectiveOccurrence) return;
+            if (course.id === original.id) {
+              batch.set(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', course.id), normalizeCourse(data, 0, viewWeekId));
+            } else {
+              batch.update(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', course.id), {
+                value: Number(data.value),
+                price: Number(data.value),
+                priceEffectiveWeek: viewWeekId,
+                priceEffectiveOccurrence,
+              });
+            }
+            return;
+          }
+
+          let futureStartWeek = course.baseWeekId && course.baseWeekId > viewWeekId
+            ? course.baseWeekId
+            : viewWeekId;
+          let safety = 0;
+          let foundFutureOccurrence = false;
+          while (safety < 520) {
+            safety += 1;
+            if (course.endWeekId && futureStartWeek >= course.endWeekId) return;
+            const occurrenceKey = getOccurrenceKey(futureStartWeek, course);
+            if (isCourseVisibleInWeek(course, futureStartWeek) && occurrenceKey >= priceEffectiveOccurrence) {
+              foundFutureOccurrence = true;
+              break;
+            }
+            futureStartWeek = getNextWeekId(futureStartWeek);
+          }
+          if (!foundFutureOccurrence) return;
+
+          const hasHistoricalOccurrences = !course.baseWeekId || course.baseWeekId < futureStartWeek;
+          const futureExcludedWeeks = (course.excludedWeeks || []).filter(week => week >= futureStartWeek);
+          const pastExcludedWeeks = (course.excludedWeeks || []).filter(week => week < futureStartWeek);
+          const sourceForFuture = course.id === original.id ? data : course;
+
+          if (hasHistoricalOccurrences) {
+            const futureCourseId = Math.random().toString(36).substr(2, 9);
+            const futureCourse = {
+              ...sourceForFuture,
+              id: futureCourseId,
+              value: Number(data.value),
+              price: Number(data.value),
+              baseWeekId: futureStartWeek,
+              weekId: null,
+              excludedWeeks: futureExcludedWeeks,
+              priceEffectiveWeek: futureStartWeek,
+              priceEffectiveOccurrence,
+            };
+            if (course.endWeekId) futureCourse.endWeekId = course.endWeekId;
+            else delete futureCourse.endWeekId;
+
+            batch.update(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', course.id), {
+              endWeekId: futureStartWeek,
+              excludedWeeks: pastExcludedWeeks,
+            });
+            batch.set(
+              doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', futureCourseId),
+              normalizeCourse(futureCourse, 0, futureStartWeek),
+            );
+          } else {
+            const updatedCourse = {
+              ...sourceForFuture,
+              id: course.id,
+              value: Number(data.value),
+              price: Number(data.value),
+              priceEffectiveWeek: futureStartWeek,
+              priceEffectiveOccurrence,
+            };
+            batch.set(
+              doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', course.id),
+              normalizeCourse(updatedCourse, 0, futureStartWeek),
+            );
+          }
         });
-        batch.set(
-          doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', newCourseId),
-          validatedFutureCourse,
-        );
+
         await batch.commit();
-        console.info('[schedule:course-save] price history split complete', {
-          previousCourseId: original.id,
-          futureCourseId: newCourseId,
-          effectiveWeek: viewWeekId,
+        console.info('[schedule:course-save] exact price history update complete', {
+          title: original.title,
+          effectiveOccurrence: priceEffectiveOccurrence,
         });
         setIsModalOpen(false);
         return;
@@ -1263,7 +1379,17 @@ export default function App() {
         id: targetId,
         name: validatedCourse.name,
       });
-      await setDoc(doc(db, `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${targetId}`), validatedCourse);
+      const batch = writeBatch(db);
+      batch.set(doc(db, `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${targetId}`), validatedCourse);
+      if (typeof formData.pendingLessonTrackingEnabled === 'boolean') {
+        courses.filter(course => course.title === data.title && course.id !== targetId).forEach(course => {
+          batch.update(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', course.id), {
+            lessonTrackingEnabled: nextLessonEnabled,
+            lessonTrackingAnchors: data.lessonTrackingAnchors,
+          });
+        });
+      }
+      await batch.commit();
       setIsModalOpen(false);
     } catch (error) {
       logFirestoreError('course:save', error);
@@ -1331,16 +1457,56 @@ export default function App() {
     } catch (e) { console.error(e); } finally { setSyncing(false); }
   };
 
-  const updateLessonTrackingForTitle = async (title, { enabled, reset = false }) => {
+  const openLessonSettingsDialog = () => {
+    const title = formData.title.trim();
+    if (!title) return;
+    const editingCourse = editingCourseId ? courses.find(course => course.id === editingCourseId) : null;
+    const savedSettings = lessonSettingsByTitle.get(title);
+    const currentLessonNumber = editingCourse
+      ? getCourseLessonNumber(editingCourse, viewWeekId, true)
+      : Number(formData.pendingLessonNumber) || 1;
+
+    setLessonSettingsDraft({
+      enabled: typeof formData.pendingLessonTrackingEnabled === 'boolean'
+        ? formData.pendingLessonTrackingEnabled
+        : Boolean(savedSettings?.enabled),
+      lessonNumber: Math.max(1, currentLessonNumber || 1),
+    });
+    setLessonSettingsStatus('');
+    setIsLessonSettingsModalOpen(true);
+  };
+
+  const saveLessonSettingsFromCurrentCourse = async (lessonNumberOverride = null) => {
+    const title = formData.title.trim();
+    if (!title) return;
+    const lessonNumber = Math.max(1, Math.round(Number(lessonNumberOverride ?? lessonSettingsDraft.lessonNumber) || 1));
+    const enabled = Boolean(lessonSettingsDraft.enabled || lessonNumberOverride !== null);
+    const editingCourse = editingCourseId ? courses.find(course => course.id === editingCourseId) : null;
+
+    if (!editingCourse) {
+      setFormData(prev => ({
+        ...prev,
+        pendingLessonTrackingEnabled: enabled,
+        pendingLessonNumber: enabled ? lessonNumber : null,
+      }));
+      setLessonSettingsStatus(enabled ? `保存课程后，本堂将显示为第${lessonNumber}课时` : '保存课程后将关闭课时编号');
+      setTimeout(() => setIsLessonSettingsModalOpen(false), 500);
+      return;
+    }
+
     if (!user) return;
     const matchingCourses = courses.filter(course => course.title === title);
-    if (matchingCourses.length === 0) return;
-
-    const existingStarts = lessonSettingsByTitle.get(title)?.cycleStarts || new Set();
-    const nextStarts = Array.from(new Set([
-      ...existingStarts,
-      ...(reset || (enabled && existingStarts.size === 0) ? [viewWeekId] : []),
-    ])).sort();
+    const anchorMap = new Map(lessonSettingsByTitle.get(title)?.anchors || []);
+    const currentAnchor = {
+      weekId: viewWeekId,
+      colIndex: editingCourse.colIndex,
+      startTime: editingCourse.startTime,
+      courseId: editingCourse.id,
+      lessonNumber,
+    };
+    anchorMap.set(getLessonAnchorKey(currentAnchor), currentAnchor);
+    const nextAnchors = Array.from(anchorMap.values())
+      .sort((a, b) => getLessonAnchorKey(a).localeCompare(getLessonAnchorKey(b)));
 
     saveSnapshotForUndo();
     setSyncing(true);
@@ -1349,25 +1515,19 @@ export default function App() {
       matchingCourses.forEach(course => {
         batch.update(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', course.id), {
           lessonTrackingEnabled: enabled,
-          lessonCycleStarts: nextStarts,
+          lessonTrackingAnchors: nextAnchors,
         });
       });
       await batch.commit();
+      setLessonSettingsStatus(enabled ? `已从本堂设为第${lessonNumber}课时` : '已关闭课时编号');
+      setTimeout(() => setIsLessonSettingsModalOpen(false), 500);
     } catch (error) {
-      logFirestoreError(reset ? 'lesson-cycle:reset' : 'lesson-cycle:toggle', error);
+      logFirestoreError('lesson-tracking:save', error);
+      setLessonSettingsStatus('保存失败，请重试');
     } finally {
       setSyncing(false);
     }
   };
-
-  const handleToggleLessonTracking = (title) => {
-    const enabled = lessonSettingsByTitle.get(title)?.enabled || false;
-    return updateLessonTrackingForTitle(title, { enabled: !enabled });
-  };
-
-  const handleResetLessonCycle = (title) => (
-    updateLessonTrackingForTitle(title, { enabled: true, reset: true })
-  );
 
   const handleDownload = async () => {
     if (!scheduleRef.current) return;
@@ -1846,6 +2006,7 @@ export default function App() {
                                   recurrence: existingCourse.isBiweekly ? 'biweekly' : (existingCourse.isFixed ? 'weekly' : 'temp'),
                                   lessonTrackingEnabled: existingCourse.lessonTrackingEnabled || false,
                                   lessonCycleStarts: existingCourse.lessonCycleStarts || [],
+                                  lessonTrackingAnchors: existingCourse.lessonTrackingAnchors || [],
                                 });
                               } else {
                                 setFormData({...formData, title: name});
@@ -1865,8 +2026,8 @@ export default function App() {
                   
                   {isNameManagerOpen && (
                     <div className="absolute top-full mt-2 left-0 right-0 bg-white border border-slate-200 rounded-2xl shadow-2xl z-[70] overflow-hidden animate-in slide-in-from-top-2">
-                      <div className="p-3 bg-slate-50 border-b border-slate-200 text-[13px] font-black text-slate-500">学员管理（可开启课时编号，并从当前查看周重置）</div>
-                      <div className="max-h-[280px] overflow-y-auto">
+                      <div className="p-3 bg-slate-50 border-b border-slate-200 text-[13px] font-black text-slate-500">已保存的学员名称（课时设置请在备注栏右侧操作）</div>
+                      <div className="max-h-[220px] overflow-y-auto">
                         {Array.from(new Set(courses.map(c=>c.title))).filter(n=>n).length > 0 ? (
                           Array.from(new Set(courses.map(c=>c.title))).filter(n=>n).map((name, i) => (
                             <div key={i} className="px-4 py-2.5 flex justify-between items-center group hover:bg-slate-50 transition-colors border-b border-slate-100 last:border-b-0">
@@ -1892,22 +2053,6 @@ export default function App() {
                                 <>
                                   <span className="font-bold text-slate-700 text-[15px] truncate pr-2 flex-1 min-w-[100px]">{String(name)}</span>
                                   <div className="flex gap-1.5 shrink-0 opacity-100 transition-opacity items-center">
-                                    <button
-                                      onClick={() => handleToggleLessonTracking(name)}
-                                      className={`px-3 py-1.5 rounded-xl text-[12px] font-black transition-all ${lessonSettingsByTitle.get(name)?.enabled ? 'bg-emerald-100 text-emerald-700 hover:bg-emerald-200' : 'bg-slate-100 text-slate-400 hover:bg-slate-200'}`}
-                                      title="开启后，课表会显示该学员当前是第几个课时"
-                                    >
-                                      {lessonSettingsByTitle.get(name)?.enabled ? '课时编号：开' : '课时编号：关'}
-                                    </button>
-                                    {lessonSettingsByTitle.get(name)?.enabled && (
-                                      <button
-                                        onClick={() => handleResetLessonCycle(name)}
-                                        className="px-3 py-1.5 rounded-xl text-[12px] font-black bg-indigo-50 text-indigo-600 hover:bg-indigo-100 transition-all flex items-center gap-1"
-                                        title={`从${viewWeekId}这一周重新计为第1课时`}
-                                      >
-                                        <RefreshCw size={12}/> 本周重置
-                                      </button>
-                                    )}
                                     <button onClick={() => setEditingNameState({oldName: name, newName: name})} className="px-3 py-1.5 rounded-xl text-[12px] font-black bg-slate-100 text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 transition-all">改名</button>
                                     <button onClick={() => handleBatchDeleteName(name)} className={`px-3 py-1.5 rounded-xl text-[12px] font-black transition-all ${deleteConfirmTitle===name ? 'bg-red-500 text-white animate-pulse shadow-sm':'bg-slate-100 text-slate-400 hover:text-red-500 hover:bg-red-50'}`}>{deleteConfirmTitle===name ? '确认移除?' : '移除'}</button>
                                   </div>
@@ -1939,8 +2084,8 @@ export default function App() {
                       className="w-full h-12 border-2 border-slate-100 rounded-2xl pl-14 pr-4 text-[14px] font-black outline-none focus:border-indigo-500 focus:bg-white bg-slate-50/40 transition-all shadow-sm"
                     />
                   </div>
-                  {editingCourseId && courses.find(course => course.id === editingCourseId)?.isFixed && (
-                    <p className="text-[10px] text-indigo-500 font-bold mt-1">调价将从当前查看周生效，之前周次保留原价</p>
+                  {editingCourseId && (
+                    <p className="text-[10px] text-indigo-500 font-bold mt-1">调价从当前这堂课精确生效；更早的课程保留原价</p>
                   )}
                 </div>
                 <div className="space-y-2">
@@ -2017,14 +2162,24 @@ export default function App() {
                     <AlignLeft size={14}/>
                     <span>备注说明</span>
                   </div>
-                  <button 
-                    onClick={handleAIGenerateNote} 
-                    disabled={isGeneratingNote || !formData.title} 
-                    className={`text-[11px] flex items-center gap-1 transition-colors px-2 py-1 rounded-lg shadow-sm border ${!formData.title ? 'bg-slate-50 text-slate-300 border-slate-100' : 'bg-gradient-to-r from-indigo-50 to-purple-50 text-indigo-600 border-indigo-200 hover:opacity-80'}`}
-                  >
-                    <Sparkles size={12} className={isGeneratingNote ? "animate-spin" : "text-purple-400"}/> 
-                    {isGeneratingNote ? 'AI 撰写中...' : 'AI 智能扩写'}
-                  </button>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={openLessonSettingsDialog}
+                      disabled={!formData.title.trim()}
+                      className={`text-[11px] flex items-center gap-1 transition-colors px-2.5 py-1 rounded-lg shadow-sm border ${!formData.title.trim() ? 'bg-slate-50 text-slate-300 border-slate-100' : 'bg-emerald-50 text-emerald-700 border-emerald-200 hover:bg-emerald-100'}`}
+                    >
+                      <Settings2 size={12}/>
+                      课时设置
+                    </button>
+                    <button
+                      onClick={handleAIGenerateNote}
+                      disabled={isGeneratingNote || !formData.title}
+                      className={`text-[11px] flex items-center gap-1 transition-colors px-2 py-1 rounded-lg shadow-sm border ${!formData.title ? 'bg-slate-50 text-slate-300 border-slate-100' : 'bg-gradient-to-r from-indigo-50 to-purple-50 text-indigo-600 border-indigo-200 hover:opacity-80'}`}
+                    >
+                      <Sparkles size={12} className={isGeneratingNote ? "animate-spin" : "text-purple-400"}/>
+                      {isGeneratingNote ? 'AI 撰写中...' : 'AI 智能扩写'}
+                    </button>
+                  </div>
                 </div>
                 <input 
                   type="text" 
@@ -2048,6 +2203,65 @@ export default function App() {
                 {editingCourseId && <button onClick={() => handleSave(true)} className="px-5 py-2.5 bg-white border border-indigo-100 text-indigo-600 rounded-2xl shadow-sm hover:bg-indigo-50 flex items-center gap-1 transition-all text-[12px] font-sans"><Copy size={16}/> 复制给本周</button>}
                 <button onClick={() => handleSave(false)} className="px-8 py-2.5 bg-indigo-600 text-white rounded-2xl shadow-lg hover:bg-indigo-700 transition-all text-[13px]">保存</button>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {isLessonSettingsModalOpen && (
+        <div className="fixed inset-0 bg-slate-900/65 backdrop-blur-sm flex items-center justify-center z-[90] p-4 animate-in fade-in">
+          <div className="bg-white rounded-[28px] shadow-2xl w-full max-w-md border border-slate-100 overflow-hidden">
+            <div className="px-6 py-5 bg-emerald-50 border-b border-emerald-100 flex items-center justify-between">
+              <div>
+                <h2 className="text-lg font-black text-slate-800 flex items-center gap-2"><Settings2 size={19} className="text-emerald-600"/> 课时编号设置</h2>
+                <p className="text-[11px] font-bold text-slate-500 mt-1">{formData.title} · {DAYS[formData.colIndex]} {formData.startTime}</p>
+              </div>
+              <button onClick={() => setIsLessonSettingsModalOpen(false)} className="p-2 rounded-xl text-slate-400 hover:bg-white hover:text-slate-600 transition-all"><X size={18}/></button>
+            </div>
+
+            <div className="p-6 space-y-5">
+              <div className="flex items-center justify-between p-4 rounded-2xl bg-slate-50 border border-slate-100">
+                <div>
+                  <div className="text-[14px] font-black text-slate-700">显示课时编号</div>
+                  <div className="text-[11px] font-bold text-slate-400 mt-0.5">关闭后保留历史设置，但课程卡不显示编号</div>
+                </div>
+                <button
+                  onClick={() => setLessonSettingsDraft(prev => ({ ...prev, enabled: !prev.enabled }))}
+                  className={`relative w-14 h-8 rounded-full transition-all ${lessonSettingsDraft.enabled ? 'bg-emerald-500' : 'bg-slate-300'}`}
+                >
+                  <span className={`absolute top-1 w-6 h-6 bg-white rounded-full shadow transition-all ${lessonSettingsDraft.enabled ? 'left-7' : 'left-1'}`}></span>
+                </button>
+              </div>
+
+              <div className={`space-y-3 transition-opacity ${lessonSettingsDraft.enabled ? 'opacity-100' : 'opacity-40 pointer-events-none'}`}>
+                <label className="text-[13px] font-black text-slate-700">当前这堂课是第几课时</label>
+                <div className="flex items-center gap-3">
+                  <button onClick={() => setLessonSettingsDraft(prev => ({ ...prev, lessonNumber: Math.max(1, prev.lessonNumber - 1) }))} className="w-12 h-12 rounded-2xl bg-slate-100 text-slate-600 text-xl font-black hover:bg-slate-200">−</button>
+                  <input
+                    type="number"
+                    min="1"
+                    step="1"
+                    value={lessonSettingsDraft.lessonNumber}
+                    onChange={e => setLessonSettingsDraft(prev => ({ ...prev, lessonNumber: Math.max(1, Math.round(Number(e.target.value) || 1)) }))}
+                    className="flex-1 h-12 rounded-2xl border-2 border-emerald-100 text-center text-lg font-black text-emerald-700 outline-none focus:border-emerald-400"
+                  />
+                  <button onClick={() => setLessonSettingsDraft(prev => ({ ...prev, lessonNumber: prev.lessonNumber + 1 }))} className="h-12 px-4 rounded-2xl bg-emerald-50 text-emerald-700 text-[12px] font-black hover:bg-emerald-100 flex items-center gap-1"><Plus size={15}/> 新增一节</button>
+                </div>
+                <p className="text-[11px] font-bold text-slate-400 leading-relaxed">保存后从当前这堂课开始按此数字计算，之前的课程编号保持不变，后续课程自动递增。</p>
+              </div>
+
+              {lessonSettingsStatus && <div className="text-center text-[12px] font-black text-emerald-600 bg-emerald-50 rounded-xl py-2 border border-emerald-100">{lessonSettingsStatus}</div>}
+            </div>
+
+            <div className="px-6 py-5 bg-slate-50 border-t border-slate-100 flex flex-col gap-2.5">
+              {lessonSettingsDraft.enabled && (
+                <button onClick={() => saveLessonSettingsFromCurrentCourse(1)} className="w-full py-3 rounded-2xl bg-amber-50 text-amber-700 border border-amber-200 font-black hover:bg-amber-100 transition-all flex items-center justify-center gap-2">
+                  <RefreshCw size={15}/> 从当前这堂重置为第1课时
+                </button>
+              )}
+              <button onClick={() => saveLessonSettingsFromCurrentCourse()} className={`w-full py-3 rounded-2xl font-black transition-all ${lessonSettingsDraft.enabled ? 'bg-emerald-600 text-white hover:bg-emerald-700 shadow-lg shadow-emerald-100' : 'bg-slate-700 text-white hover:bg-slate-800'}`}>
+                {lessonSettingsDraft.enabled ? `保存：当前为第${lessonSettingsDraft.lessonNumber}课时` : '保存并关闭课时编号'}
+              </button>
             </div>
           </div>
         </div>

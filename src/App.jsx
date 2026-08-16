@@ -1,4 +1,4 @@
-import { useState, useMemo, useEffect, useRef } from 'react';
+import { useState, useMemo, useEffect, useRef, useCallback } from 'react';
 import { Calendar, ChevronLeft, ChevronRight, ChevronDown, Plus, X, Clock, AlertCircle, Download, RefreshCw, Cloud, Copy, FileSpreadsheet, Layers, Settings2, Undo, Database, AlignLeft, Sparkles, Bot, Maximize2, Minimize2, LogOut, Lock, Mail } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut } from 'firebase/auth';
@@ -83,6 +83,24 @@ const getDiffWeeks = (w1, w2) => {
   return Math.round(Math.abs(date2 - date1) / 604800000);
 };
 
+const isCourseVisibleInWeek = (course, weekId) => {
+  if (course.isFixed) {
+    const isAfterStart = course.baseWeekId ? weekId >= course.baseWeekId : true;
+    const isBeforeEnd = course.endWeekId ? weekId < course.endWeekId : true;
+    return isAfterStart
+      && isBeforeEnd
+      && !(course.excludedWeeks?.includes(weekId))
+      && (!course.isBiweekly || getDiffWeeks(course.baseWeekId, weekId) % 2 === 0);
+  }
+  return course.weekId === weekId;
+};
+
+const getCourseDurationHours = (course) => {
+  let durationMinutes = timeToMinutes(course.endTime) - timeToMinutes(course.startTime);
+  if (durationMinutes < 0) durationMinutes += 1440;
+  return durationMinutes / 60;
+};
+
 // --- Gemini API 集成逻辑 ---
 const callGeminiAPI = async (prompt) => {
   const apiKey = ""; 
@@ -161,8 +179,18 @@ const INITIAL_COURSES = [
   { id: 'cs20260904', title: 'CS', colIndex: 4, startTime: '17:00', endTime: '18:30', value: 400, isFixed: true, weekId: null, baseWeekId: '2026-08-31', endWeekId: '2026-09-07', excludedWeeks: [], tag: 'P', notes: '' },
 ];
 
-const COURSE_SCHEMA_VERSION = 2;
+const COURSE_SCHEMA_VERSION = 3;
 const COURSE_TIME_PATTERN = /^([01]\d|2[0-3]):([0-5]\d)$/;
+
+const getLegacyLessonTrackingDefaults = (name) => {
+  if (name.includes('海辰数学')) {
+    return { enabled: true, cycleStarts: ['2026-04-20', '2026-05-18'] };
+  }
+  if (name.includes('David')) {
+    return { enabled: true, cycleStarts: ['2026-06-01'] };
+  }
+  return { enabled: false, cycleStarts: [] };
+};
 
 const normalizeCourse = (rawCourse, index, targetWeekId = currentWeekId) => {
   if (!rawCourse || typeof rawCourse !== 'object' || Array.isArray(rawCourse)) {
@@ -201,6 +229,16 @@ const normalizeCourse = (rawCourse, index, targetWeekId = currentWeekId) => {
 
   const isFixed = Boolean(rawCourse.isFixed);
   const isBiweekly = Boolean(rawCourse.isBiweekly);
+  const legacyLessonTracking = getLegacyLessonTrackingDefaults(name);
+  const lessonTrackingEnabled = typeof rawCourse.lessonTrackingEnabled === 'boolean'
+    ? rawCourse.lessonTrackingEnabled
+    : legacyLessonTracking.enabled;
+  const lessonCycleStarts = Array.from(new Set(
+    (Array.isArray(rawCourse.lessonCycleStarts)
+      ? rawCourse.lessonCycleStarts
+      : legacyLessonTracking.cycleStarts)
+      .filter(week => typeof week === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(week))
+  )).sort();
   const normalized = {
     id,
     name,
@@ -220,11 +258,14 @@ const normalizeCourse = (rawCourse, index, targetWeekId = currentWeekId) => {
     excludedWeeks: Array.isArray(rawCourse.excludedWeeks)
       ? rawCourse.excludedWeeks.filter(week => typeof week === 'string')
       : [],
+    lessonTrackingEnabled,
+    lessonCycleStarts,
     notes: typeof rawCourse.notes === 'string' ? rawCourse.notes : '',
   };
 
   if (isFixed && rawCourse.baseWeekId) normalized.baseWeekId = String(rawCourse.baseWeekId);
   if (isFixed && rawCourse.endWeekId) normalized.endWeekId = String(rawCourse.endWeekId);
+  if (typeof rawCourse.priceEffectiveWeek === 'string') normalized.priceEffectiveWeek = rawCourse.priceEffectiveWeek;
   if (rawCourse.recurrence) normalized.recurrence = String(rawCourse.recurrence);
 
   return normalized;
@@ -326,25 +367,21 @@ const getCourseTotalValue = (course, courseDate) => {
   if (!course || !course.startTime || !course.endTime) return 0;
   let durMins = timeToMinutes(course.endTime) - timeToMinutes(course.startTime);
   if (durMins < 0) durMins += 1440;
-  
-  let hourlyRate = Number(course.value) || 0;
-  
-  if (course.title && course.title.includes('David')) {
-    const thresholdDate = new Date(2026, 5, 3);
-    thresholdDate.setHours(0, 0, 0, 0);
+  let hourlyRate = Number(course.price ?? course.value) || 0;
+
+  // 兼容升级前已存在的两条日期计价规则；新建或调价后的课程均使用保存的明确单价。
+  if (!course.priceEffectiveWeek && courseDate) {
     const checkDate = new Date(courseDate);
     checkDate.setHours(0, 0, 0, 0);
-    if (checkDate >= thresholdDate) hourlyRate = 400;
+
+    if (course.title?.includes('David') && checkDate >= new Date(2026, 5, 3)) {
+      hourlyRate = 400;
+    }
+    if (course.title?.includes('芮彤') && checkDate < new Date(2026, 4, 10)) {
+      hourlyRate = 260;
+    }
   }
 
-  if (courseDate && course.title && course.title.includes('芮彤')) {
-    const thresholdDate = new Date(2026, 4, 10);
-    thresholdDate.setHours(0, 0, 0, 0);
-    const checkDate = new Date(courseDate);
-    checkDate.setHours(0, 0, 0, 0);
-    if (checkDate < thresholdDate) hourlyRate = 260;
-  }
-  
   return Math.round(hourlyRate * (durMins / 60));
 };
 
@@ -565,6 +602,8 @@ export default function App() {
           || !Object.hasOwn(course, 'weekday')
           || !Object.hasOwn(course, 'price')
           || !Object.hasOwn(course, 'category')
+          || !Object.hasOwn(course, 'lessonTrackingEnabled')
+          || !Object.hasOwn(course, 'lessonCycleStarts')
         );
 
         if (requiresSchemaMigration) {
@@ -605,49 +644,66 @@ export default function App() {
   useEffect(() => { coursesRefLatest.current = courses; }, [courses]);
 
   const viewWeekId = getWeekId(viewWeekStart);
+  const isViewingCurrentWeek = viewWeekId === currentWeekId;
 
-  const getCourseDisplayInfo = (course, currentWeek) => {
-    let baseTitle = course.title ? course.title.replace(/\s*\(第\d+课\)/g, '') : '';
+  const lessonSettingsByTitle = useMemo(() => {
+    const settings = new Map();
+    courses.forEach(course => {
+      if (!course.title) return;
+      const existing = settings.get(course.title) || {
+        enabled: false,
+        cycleStarts: new Set(),
+        settingWeek: '',
+      };
+      const settingWeek = course.baseWeekId || course.weekId || '';
+      if (settingWeek >= existing.settingWeek) {
+        existing.enabled = Boolean(course.lessonTrackingEnabled);
+        existing.settingWeek = settingWeek;
+      }
+      (course.lessonCycleStarts || []).forEach(week => existing.cycleStarts.add(week));
+      settings.set(course.title, existing);
+    });
+    return settings;
+  }, [courses]);
+
+  const getCourseDisplayInfo = useCallback((course, currentWeek) => {
+    const baseTitle = course.title ? course.title.replace(/\s*\(第\d+课\)/g, '') : '';
     let dynamicNote = '';
     const [y, m, d] = currentWeek.split('-').map(Number);
     const targetMon = new Date(y, m - 1, d);
 
-    if (course.title && course.title.includes('海辰数学')) {
-      let count = 0, safety = 0;
-      const restartDate = new Date(2026, 4, 18);
-      let iter = targetMon >= restartDate ? new Date(2026, 4, 18) : new Date(2026, 3, 20);
+    const trackingSettings = lessonSettingsByTitle.get(course.title);
+    const cycleStart = trackingSettings?.enabled
+      ? Array.from(trackingSettings.cycleStarts).filter(week => week <= currentWeek).sort().at(-1)
+      : null;
+
+    if (cycleStart) {
+      const [startYear, startMonth, startDay] = cycleStart.split('-').map(Number);
+      const iter = new Date(startYear, startMonth - 1, startDay);
+      let lessonCount = 0;
+      let safety = 0;
 
       while (iter <= targetMon && safety < 1000) {
-        safety++;
-        const iw = getWeekId(iter);
-        const wc = courses.filter(c => {
-          if (!c.title || !c.title.includes('海辰数学')) return false;
-          if (c.isFixed) {
-            const isAfterStart = c.baseWeekId ? iw >= c.baseWeekId : true;
-            const isBeforeEnd = c.endWeekId ? iw < c.endWeekId : true;
-            return isAfterStart && isBeforeEnd && !(c.excludedWeeks?.includes(iw)) && (!c.isBiweekly || getDiffWeeks(c.baseWeekId, iw) % 2 === 0);
-          }
-          return c.weekId === iw;
-        }).sort((a,b) => a.colIndex !== b.colIndex ? a.colIndex - b.colIndex : timeToMinutes(a.startTime) - timeToMinutes(b.startTime));
-        
-        if (iw === currentWeek) {
-          for (let c of wc) {
-            let dur = timeToMinutes(c.endTime) - timeToMinutes(c.startTime);
-            if (dur < 0) dur += 1440;
-            count += (dur / 60);
-            if (c.id === course.id) break;
-          }
-          break;
-        } else {
-          for (let c of wc) {
-            let dur = timeToMinutes(c.endTime) - timeToMinutes(c.startTime);
-            if (dur < 0) dur += 1440;
-            count += (dur / 60);
-          }
+        safety += 1;
+        const iterWeekId = getWeekId(iter);
+        const weekCourses = courses
+          .filter(candidate => candidate.title === course.title && isCourseVisibleInWeek(candidate, iterWeekId))
+          .sort((a, b) => a.colIndex !== b.colIndex
+            ? a.colIndex - b.colIndex
+            : timeToMinutes(a.startTime) - timeToMinutes(b.startTime));
+
+        for (const candidate of weekCourses) {
+          lessonCount += getCourseDurationHours(candidate);
+          if (iterWeekId === currentWeek && candidate.id === course.id) break;
         }
+        if (iterWeekId === currentWeek) break;
         iter.setDate(iter.getDate() + 7);
       }
-      dynamicNote = `第${Number.isInteger(count) ? count : count.toFixed(1)}课`;
+
+      if (lessonCount > 0) {
+        const formattedCount = Number.isInteger(lessonCount) ? lessonCount : lessonCount.toFixed(1);
+        dynamicNote = `第${formattedCount}课时`;
+      }
     }
 
     if (course.title && course.title.includes('芮彤')) {
@@ -658,15 +714,8 @@ export default function App() {
       while (currentIterMon <= targetMon && safety < 1000) {
         safety++;
         const iw = getWeekId(currentIterMon);
-        const wc = courses.filter(c => {
-          if (!c.title || !c.title.includes('芮彤')) return false;
-          if (c.isFixed) {
-            const isAfterStart = c.baseWeekId ? iw >= c.baseWeekId : true;
-            const isBeforeEnd = c.endWeekId ? iw < c.endWeekId : true;
-            return isAfterStart && isBeforeEnd && !(c.excludedWeeks?.includes(iw)) && (!c.isBiweekly || getDiffWeeks(c.baseWeekId, iw) % 2 === 0);
-          }
-          return c.weekId === iw;
-        }).sort((a,b) => a.colIndex !== b.colIndex ? a.colIndex - b.colIndex : timeToMinutes(a.startTime) - timeToMinutes(b.startTime));
+        const wc = courses.filter(c => c.title?.includes('芮彤') && isCourseVisibleInWeek(c, iw))
+          .sort((a,b) => a.colIndex !== b.colIndex ? a.colIndex - b.colIndex : timeToMinutes(a.startTime) - timeToMinutes(b.startTime));
 
         for (let c of wc) {
            const cDate = new Date(currentIterMon);
@@ -694,62 +743,13 @@ export default function App() {
       }
     }
 
-    if (course.title && course.title.includes('David')) {
-      let count = 0, safety = 0;
-      let startMon = getMonday(new Date(2026, 5, 3)); 
-      let currentIterMon = new Date(startMon);
-      
-      while (currentIterMon <= targetMon && safety < 1000) {
-        safety++;
-        const iw = getWeekId(currentIterMon);
-        const wc = courses.filter(c => {
-          if (!c.title || !c.title.includes('David')) return false;
-          if (c.isFixed) {
-            const isAfterStart = c.baseWeekId ? iw >= c.baseWeekId : true;
-            const isBeforeEnd = c.endWeekId ? iw < c.endWeekId : true;
-            return isAfterStart && isBeforeEnd && !(c.excludedWeeks?.includes(iw)) && (!c.isBiweekly || getDiffWeeks(c.baseWeekId, iw) % 2 === 0);
-          }
-          return c.weekId === iw;
-        }).sort((a,b) => a.colIndex !== b.colIndex ? a.colIndex - b.colIndex : timeToMinutes(a.startTime) - timeToMinutes(b.startTime));
-
-        for (let c of wc) {
-           const cDate = new Date(currentIterMon);
-           cDate.setDate(cDate.getDate() + c.colIndex);
-           
-           if (cDate < new Date(2026, 5, 3)) continue;
-
-           if (iw === currentWeek) {
-              if (c.colIndex < course.colIndex || (c.colIndex === course.colIndex && timeToMinutes(c.startTime) <= timeToMinutes(course.startTime))) {
-                 let dur = timeToMinutes(c.endTime) - timeToMinutes(c.startTime);
-                 if (dur < 0) dur += 1440;
-                 count += (dur / 60);
-              }
-           } else {
-              let dur = timeToMinutes(c.endTime) - timeToMinutes(c.startTime);
-              if (dur < 0) dur += 1440;
-              count += (dur / 60);
-           }
-        }
-        currentIterMon.setDate(currentIterMon.getDate() + 7);
-      }
-      
-      if (count > 0) {
-        const davidNote = `第${Number.isInteger(count) ? count : count.toFixed(1)}课时`;
-        dynamicNote = dynamicNote ? `${dynamicNote} | ${davidNote}` : davidNote;
-      }
-    }
-
     return { title: baseTitle, dynamicNote };
-  };
+  }, [courses, lessonSettingsByTitle]);
 
-  const visibleCourses = useMemo(() => courses.filter(c => {
-    if (c.isFixed) {
-      const isAfterStart = c.baseWeekId ? viewWeekId >= c.baseWeekId : true;
-      const isBeforeEnd = c.endWeekId ? viewWeekId < c.endWeekId : true;
-      return isAfterStart && isBeforeEnd && !(c.excludedWeeks?.includes(viewWeekId)) && (!c.isBiweekly || getDiffWeeks(c.baseWeekId, viewWeekId) % 2 === 0);
-    }
-    return c.weekId === viewWeekId;
-  }), [courses, viewWeekId]);
+  const visibleCourses = useMemo(
+    () => courses.filter(course => isCourseVisibleInWeek(course, viewWeekId)),
+    [courses, viewWeekId],
+  );
 
   const groupedCoursesByCol = useMemo(() => {
     const result = Array(7).fill(null).map(() => []);
@@ -861,7 +861,7 @@ export default function App() {
       });
     }
     return res;
-  }, [isExportModalOpen, exportRange, exportCourseFilter, courses]); 
+  }, [isExportModalOpen, exportRange, exportCourseFilter, courses, getCourseDisplayInfo]);
 
   const saveSnapshotForUndo = () => setUndoStack(prev => [...prev, JSON.parse(JSON.stringify(coursesRefLatest.current))]);
 
@@ -1176,13 +1176,24 @@ export default function App() {
     } catch (e) { console.error(e); } finally { setIsGeneratingNote(false); }
   };
 
+  const getPreferredCourseTemplate = (title) => {
+    const matchingCourses = courses.filter(course => course.title === title);
+    const visibleMatch = matchingCourses.find(course => isCourseVisibleInWeek(course, viewWeekId));
+    if (visibleMatch) return visibleMatch;
+
+    return matchingCourses
+      .filter(course => (course.baseWeekId || course.weekId || '') <= viewWeekId)
+      .sort((a, b) => (b.baseWeekId || b.weekId || '').localeCompare(a.baseWeekId || a.weekId || ''))[0]
+      || matchingCourses[0];
+  };
+
   function openModal(course = null, colIdx = 0, defaultStartTime = '10:00') {
     setIsNameManagerOpen(false); setIsTitleDropdownOpen(false); setDeleteConfirmTitle(null);
     if (course) {
       let dur = timeToMinutes(course.endTime) - timeToMinutes(course.startTime); if (dur < 0) dur += 1440;
       setEditingCourseId(course.id); setFormData({ ...course, duration: dur, recurrence: course.isBiweekly ? 'biweekly' : (course.isFixed ? 'weekly' : 'temp'), notes: course.notes || '' });
     } else {
-      setEditingCourseId(null); setFormData({ title: '', colIndex: colIdx, startTime: defaultStartTime, duration: 60, value: 400, recurrence: 'temp', excludedWeeks: [], tag: 'P', notes: '' });
+      setEditingCourseId(null); setFormData({ title: '', colIndex: colIdx, startTime: defaultStartTime, duration: 60, value: 400, recurrence: 'temp', excludedWeeks: [], lessonTrackingEnabled: false, lessonCycleStarts: [], tag: 'P', notes: '' });
     }
     setIsModalOpen(true);
   }
@@ -1190,9 +1201,16 @@ export default function App() {
   const handleSave = async (isDuplicate = false) => {
     if (!formData.title.trim() || !user) return;
     saveSnapshotForUndo(); setSyncing(true);
-    const targetId = (isDuplicate || !editingCourseId) ? Math.random().toString(36).substr(2, 9) : editingCourseId;
     const original = editingCourseId ? courses.find(c => c.id === editingCourseId) : null;
+    const targetId = (isDuplicate || !editingCourseId) ? Math.random().toString(36).substr(2, 9) : editingCourseId;
     const data = { ...formData, id: targetId, endTime: minutesToTime(timeToMinutes(formData.startTime) + Number(formData.duration)) };
+    data.price = Number(formData.value);
+    data.category = formData.tag;
+    const learnerLessonSettings = lessonSettingsByTitle.get(formData.title.trim());
+    if (learnerLessonSettings) {
+      data.lessonTrackingEnabled = learnerLessonSettings.enabled;
+      data.lessonCycleStarts = Array.from(learnerLessonSettings.cycleStarts).sort();
+    }
     
     data.isFixed = data.recurrence !== 'temp'; data.isBiweekly = data.recurrence === 'biweekly';
     if (data.isFixed) data.baseWeekId = (isDuplicate ? viewWeekId : (original?.baseWeekId || viewWeekId)); else delete data.baseWeekId;
@@ -1200,25 +1218,52 @@ export default function App() {
     if (isDuplicate) data.excludedWeeks = [];
 
     try {
+      const priceChanged = original && Number(original.value) !== Number(data.value);
+      if (isDuplicate || !original || priceChanged) data.priceEffectiveWeek = viewWeekId;
+      const shouldSplitPriceHistory = !isDuplicate
+        && original?.isFixed
+        && data.isFixed
+        && priceChanged
+        && (!original.baseWeekId || original.baseWeekId < viewWeekId);
+
+      if (shouldSplitPriceHistory) {
+        const newCourseId = Math.random().toString(36).substr(2, 9);
+        const futureCourse = {
+          ...data,
+          id: newCourseId,
+          baseWeekId: viewWeekId,
+          priceEffectiveWeek: viewWeekId,
+          excludedWeeks: (original.excludedWeeks || []).filter(week => week >= viewWeekId),
+        };
+        if (original.endWeekId) futureCourse.endWeekId = original.endWeekId;
+        else delete futureCourse.endWeekId;
+
+        const validatedFutureCourse = normalizeCourse(futureCourse, 0, viewWeekId);
+        const batch = writeBatch(db);
+        batch.update(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', original.id), {
+          endWeekId: viewWeekId,
+          excludedWeeks: (original.excludedWeeks || []).filter(week => week < viewWeekId),
+        });
+        batch.set(
+          doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', newCourseId),
+          validatedFutureCourse,
+        );
+        await batch.commit();
+        console.info('[schedule:course-save] price history split complete', {
+          previousCourseId: original.id,
+          futureCourseId: newCourseId,
+          effectiveWeek: viewWeekId,
+        });
+        setIsModalOpen(false);
+        return;
+      }
+
       const validatedCourse = normalizeCourse(data, 0, viewWeekId);
       console.info('[schedule:course-save] writing validated course', {
         id: targetId,
         name: validatedCourse.name,
       });
       await setDoc(doc(db, `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${targetId}`), validatedCourse);
-
-      const sync = [];
-      courses.forEach(c => {
-        if (c.title === formData.title && c.id !== targetId && (c.value !== formData.value || c.tag !== formData.tag)) {
-          sync.push(updateDoc(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', c.id), {
-            value: validatedCourse.price,
-            price: validatedCourse.price,
-            tag: validatedCourse.category,
-            category: validatedCourse.category,
-          }));
-        }
-      });
-      if (sync.length) await Promise.all(sync);
       setIsModalOpen(false);
     } catch (error) {
       logFirestoreError('course:save', error);
@@ -1285,6 +1330,44 @@ export default function App() {
       if (formData.title === oldName) setFormData({ ...formData, title: finalNewName });
     } catch (e) { console.error(e); } finally { setSyncing(false); }
   };
+
+  const updateLessonTrackingForTitle = async (title, { enabled, reset = false }) => {
+    if (!user) return;
+    const matchingCourses = courses.filter(course => course.title === title);
+    if (matchingCourses.length === 0) return;
+
+    const existingStarts = lessonSettingsByTitle.get(title)?.cycleStarts || new Set();
+    const nextStarts = Array.from(new Set([
+      ...existingStarts,
+      ...(reset || (enabled && existingStarts.size === 0) ? [viewWeekId] : []),
+    ])).sort();
+
+    saveSnapshotForUndo();
+    setSyncing(true);
+    try {
+      const batch = writeBatch(db);
+      matchingCourses.forEach(course => {
+        batch.update(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', course.id), {
+          lessonTrackingEnabled: enabled,
+          lessonCycleStarts: nextStarts,
+        });
+      });
+      await batch.commit();
+    } catch (error) {
+      logFirestoreError(reset ? 'lesson-cycle:reset' : 'lesson-cycle:toggle', error);
+    } finally {
+      setSyncing(false);
+    }
+  };
+
+  const handleToggleLessonTracking = (title) => {
+    const enabled = lessonSettingsByTitle.get(title)?.enabled || false;
+    return updateLessonTrackingForTitle(title, { enabled: !enabled });
+  };
+
+  const handleResetLessonCycle = (title) => (
+    updateLessonTrackingForTitle(title, { enabled: true, reset: true })
+  );
 
   const handleDownload = async () => {
     if (!scheduleRef.current) return;
@@ -1393,9 +1476,12 @@ export default function App() {
             </div>
 
             <div className="flex items-center gap-3">
-              <div className="flex items-center space-x-2 bg-slate-50 p-1 rounded-lg border border-slate-100 mr-2 shadow-inner">
+              <div className={`flex items-center space-x-2 p-1 rounded-lg border mr-2 shadow-inner transition-colors ${isViewingCurrentWeek ? 'bg-indigo-50 border-indigo-200' : 'bg-slate-50 border-slate-100'}`}>
                 <button onClick={() => { const d = new Date(viewWeekStart); d.setDate(d.getDate()-7); setViewWeekStart(d); }} className="p-1.5 rounded-md hover:bg-white shadow-sm transition-all text-slate-600"><ChevronLeft size={20} /></button>
-                <span className="text-sm font-bold w-32 text-center text-slate-800 tracking-wide">{String(viewWeekStart.getFullYear())}年 {String(weekDates[0])}</span>
+                <span className={`text-sm font-bold w-32 text-center tracking-wide ${isViewingCurrentWeek ? 'text-indigo-700' : 'text-slate-800'}`}>
+                  {isViewingCurrentWeek && <span className="block text-[9px] leading-none mb-0.5 tracking-[0.2em]">当前周</span>}
+                  {String(viewWeekStart.getFullYear())}年 {String(weekDates[0])}
+                </span>
                 <button onClick={() => { const d = new Date(viewWeekStart); d.setDate(d.getDate()+7); setViewWeekStart(d); }} className="p-1.5 rounded-md hover:bg-white shadow-sm transition-all text-slate-600"><ChevronRight size={20} /></button>
               </div>
               
@@ -1454,7 +1540,7 @@ export default function App() {
         </header>
       )}
 
-      <div className={`flex-1 overflow-auto relative bg-slate-50/50 ${isZenMode || isCssFullscreen ? 'p-0' : 'p-6'}`}>
+      <div className={`flex-1 overflow-auto relative transition-colors duration-300 ${isViewingCurrentWeek ? 'bg-indigo-50/80' : 'bg-slate-100/70'} ${isZenMode || isCssFullscreen ? 'p-0' : 'p-6'}`}>
         
         {courses.length === 0 && !syncing && !hideEmptyOverlay && (
           <div className="absolute inset-0 z-[100] flex items-center justify-center bg-slate-900/60 backdrop-blur-md p-4 animate-in fade-in">
@@ -1484,8 +1570,13 @@ export default function App() {
           </div>
         )}
         
-        <div ref={scheduleRef} onContextMenu={e => e.preventDefault()} className="min-w-[1000px] max-w-[1400px] mx-auto bg-white shadow-sm flex flex-col relative border-t border-slate-100">
-          <div className="flex border-b border-slate-100 bg-white/95 backdrop-blur-md sticky top-0 z-[40] shadow-sm">
+        <div ref={scheduleRef} onContextMenu={e => e.preventDefault()} className={`min-w-[1000px] max-w-[1400px] mx-auto bg-white flex flex-col relative border transition-all ${isViewingCurrentWeek ? 'shadow-xl shadow-indigo-200/50 border-indigo-300 ring-4 ring-indigo-100' : 'shadow-sm border-slate-200'}`}>
+          {isViewingCurrentWeek && (
+            <div className="bg-gradient-to-r from-indigo-600 to-violet-500 text-white text-center py-1.5 text-[11px] font-black tracking-[0.3em] sticky top-0 z-[45]">
+              当前周课表
+            </div>
+          )}
+          <div className={`flex border-b border-slate-100 bg-white/95 backdrop-blur-md sticky z-[40] shadow-sm ${isViewingCurrentWeek ? 'top-[26px]' : 'top-0'}`}>
             <div className="w-[65px] border-r border-slate-100 shrink-0"></div>
             {DAYS.map((day, idx) => (
               <div key={idx} className={`flex-1 text-center py-3 border-r border-slate-100 last:border-r-0 ${DAY_THEMES[idx].bg}`}>
@@ -1717,7 +1808,7 @@ export default function App() {
                 <div className="flex justify-between items-center text-[15px] font-black text-slate-700">
                   <span>课程名称</span>
                   <button onClick={() => setIsNameManagerOpen(!isNameManagerOpen)} className={`text-[15px] font-black flex items-center gap-1.5 transition-colors px-2.5 py-1 rounded-xl ${isNameManagerOpen ? 'bg-indigo-100 text-indigo-700' : 'text-indigo-500 hover:bg-slate-100'}`}>
-                    <Settings2 size={16}/> {isNameManagerOpen ? '收起管理' : '管理列表'}
+                    <Settings2 size={16}/> {isNameManagerOpen ? '收起设置' : '学员设置'}
                   </button>
                 </div>
                 
@@ -1743,14 +1834,18 @@ export default function App() {
                           <div
                             key={i}
                             onClick={() => {
-                              const existingCourse = courses.find(c => c.title === name);
+                              const existingCourse = getPreferredCourseTemplate(name);
                               if (existingCourse) {
                                 setFormData({
                                   ...formData,
                                   title: name,
                                   value: existingCourse.value,
+                                  price: existingCourse.value,
                                   tag: existingCourse.tag || 'P',
-                                  recurrence: existingCourse.isBiweekly ? 'biweekly' : (existingCourse.isFixed ? 'weekly' : 'temp')
+                                  category: existingCourse.tag || 'P',
+                                  recurrence: existingCourse.isBiweekly ? 'biweekly' : (existingCourse.isFixed ? 'weekly' : 'temp'),
+                                  lessonTrackingEnabled: existingCourse.lessonTrackingEnabled || false,
+                                  lessonCycleStarts: existingCourse.lessonCycleStarts || [],
                                 });
                               } else {
                                 setFormData({...formData, title: name});
@@ -1770,8 +1865,8 @@ export default function App() {
                   
                   {isNameManagerOpen && (
                     <div className="absolute top-full mt-2 left-0 right-0 bg-white border border-slate-200 rounded-2xl shadow-2xl z-[70] overflow-hidden animate-in slide-in-from-top-2">
-                      <div className="p-3 bg-slate-50 border-b border-slate-200 text-[13px] font-black text-slate-500">已保存的名称库（修改将全局生效）</div>
-                      <div className="max-h-[220px] overflow-y-auto">
+                      <div className="p-3 bg-slate-50 border-b border-slate-200 text-[13px] font-black text-slate-500">学员管理（可开启课时编号，并从当前查看周重置）</div>
+                      <div className="max-h-[280px] overflow-y-auto">
                         {Array.from(new Set(courses.map(c=>c.title))).filter(n=>n).length > 0 ? (
                           Array.from(new Set(courses.map(c=>c.title))).filter(n=>n).map((name, i) => (
                             <div key={i} className="px-4 py-2.5 flex justify-between items-center group hover:bg-slate-50 transition-colors border-b border-slate-100 last:border-b-0">
@@ -1795,8 +1890,24 @@ export default function App() {
                                 </div>
                               ) : (
                                 <>
-                                  <span className="font-bold text-slate-700 text-[15px] truncate pr-2 flex-1">{String(name)}</span>
-                                  <div className="flex gap-1.5 shrink-0 opacity-100 transition-opacity">
+                                  <span className="font-bold text-slate-700 text-[15px] truncate pr-2 flex-1 min-w-[100px]">{String(name)}</span>
+                                  <div className="flex gap-1.5 shrink-0 opacity-100 transition-opacity items-center">
+                                    <button
+                                      onClick={() => handleToggleLessonTracking(name)}
+                                      className={`px-3 py-1.5 rounded-xl text-[12px] font-black transition-all ${lessonSettingsByTitle.get(name)?.enabled ? 'bg-emerald-100 text-emerald-700 hover:bg-emerald-200' : 'bg-slate-100 text-slate-400 hover:bg-slate-200'}`}
+                                      title="开启后，课表会显示该学员当前是第几个课时"
+                                    >
+                                      {lessonSettingsByTitle.get(name)?.enabled ? '课时编号：开' : '课时编号：关'}
+                                    </button>
+                                    {lessonSettingsByTitle.get(name)?.enabled && (
+                                      <button
+                                        onClick={() => handleResetLessonCycle(name)}
+                                        className="px-3 py-1.5 rounded-xl text-[12px] font-black bg-indigo-50 text-indigo-600 hover:bg-indigo-100 transition-all flex items-center gap-1"
+                                        title={`从${viewWeekId}这一周重新计为第1课时`}
+                                      >
+                                        <RefreshCw size={12}/> 本周重置
+                                      </button>
+                                    )}
                                     <button onClick={() => setEditingNameState({oldName: name, newName: name})} className="px-3 py-1.5 rounded-xl text-[12px] font-black bg-slate-100 text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 transition-all">改名</button>
                                     <button onClick={() => handleBatchDeleteName(name)} className={`px-3 py-1.5 rounded-xl text-[12px] font-black transition-all ${deleteConfirmTitle===name ? 'bg-red-500 text-white animate-pulse shadow-sm':'bg-slate-100 text-slate-400 hover:text-red-500 hover:bg-red-50'}`}>{deleteConfirmTitle===name ? '确认移除?' : '移除'}</button>
                                   </div>
@@ -1821,10 +1932,16 @@ export default function App() {
                     <input
                       type="number"
                       value={formData.value}
-                      onChange={e => setFormData({...formData, value: Number(e.target.value)})}
+                      onChange={e => {
+                        const nextValue = Number(e.target.value);
+                        setFormData({...formData, value: nextValue, price: nextValue});
+                      }}
                       className="w-full h-12 border-2 border-slate-100 rounded-2xl pl-14 pr-4 text-[14px] font-black outline-none focus:border-indigo-500 focus:bg-white bg-slate-50/40 transition-all shadow-sm"
                     />
                   </div>
+                  {editingCourseId && courses.find(course => course.id === editingCourseId)?.isFixed && (
+                    <p className="text-[10px] text-indigo-500 font-bold mt-1">调价将从当前查看周生效，之前周次保留原价</p>
+                  )}
                 </div>
                 <div className="space-y-2">
                   <label className="block text-[15px] font-black text-slate-700">课程时长</label>
@@ -1879,7 +1996,7 @@ export default function App() {
                       if (t === 'P') defaultVal = 400;
                       if (t === 'B') defaultVal = 300;
                       if (t === 'A') defaultVal = 240;
-                      setFormData({...formData, tag: t, value: defaultVal});
+                      setFormData({...formData, tag: t, category: t, value: defaultVal, price: defaultVal});
                     }} className="w-4 h-4 text-indigo-600" />
                     <span className={`px-3 py-1.5 rounded-xl text-[12px] font-black shadow-sm ${TAGS[t].badge}`}>{String(t)} 类别</span>
                   </label>

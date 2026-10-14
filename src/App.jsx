@@ -114,6 +114,76 @@ const isCourseVisibleInWeek = (course, weekId) => {
   return course.weekId === weekId;
 };
 
+// 只读统计：日期字符串按本地年月日解析，不经过 UTC。
+const formatLocalDate = (date) => `${date.getFullYear()}-${formatDate(date)}`;
+const parseLocalDate = (value) => {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value || '')) return null;
+  const [year, month, day] = value.split('-').map(Number);
+  const date = new Date(year, month - 1, day);
+  return formatLocalDate(date) === value ? date : null;
+};
+const formatLessonHours = (minutes) => String(Math.round(minutes / 60 * 100) / 100);
+const formatStatisticsDate = (value) => {
+  const date = parseLocalDate(value);
+  return date ? `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日` : '';
+};
+const getStatisticsRange = (preset, now = new Date()) => {
+  const start = preset === 'week' ? getMonday(now) : new Date(now.getFullYear(), now.getMonth() - (preset === 'lastMonth' ? 1 : 0), 1);
+  const end = preset === 'lastMonth' ? new Date(now.getFullYear(), now.getMonth(), 0) : now;
+  return { start: formatLocalDate(start), end: formatLocalDate(end) };
+};
+const collectCompletedLessons = (courses, range, now) => {
+  const start = parseLocalDate(range.start), end = parseLocalDate(range.end);
+  if (!start || !end || start > end) return [];
+  end.setHours(23, 59, 59, 999);
+  const cutoff = Math.min(end.getTime(), now.getTime());
+  const lessons = [];
+  for (const day = new Date(start); day.getTime() <= cutoff; day.setDate(day.getDate() + 1)) {
+    const weekday = (day.getDay() + 6) % 7;
+    const weekId = getWeekId(getMonday(day));
+    courses.forEach(course => {
+      const status = String(course.status || '').trim().toLowerCase();
+      if (course.cancelled || course.canceled || course.isCancelled || course.isCanceled || course.isSuspended || course.completed === false || course.isCompleted === false
+        || ['cancelled', 'canceled', 'suspended', 'incomplete', 'unfinished', 'pending', '未完成', '取消', '已取消', '停课'].includes(status)) return;
+      if (Number(course.colIndex ?? course.weekday) !== weekday || !isCourseVisibleInWeek(course, weekId)) return;
+      if (!COURSE_TIME_PATTERN.test(course.startTime || '') || !COURSE_TIME_PATTERN.test(course.endTime || '')) return;
+      const startMinutes = timeToMinutes(course.startTime);
+      let minutes = timeToMinutes(course.endTime) - startMinutes;
+      if (minutes < 0) minutes += 1440;
+      if (minutes <= 0) return;
+      const startsAt = new Date(day);
+      startsAt.setMinutes(startMinutes);
+      const endsAt = new Date(day);
+      endsAt.setMinutes(startMinutes + minutes);
+      if (endsAt.getTime() > cutoff) return;
+      const category = String(course.category ?? course.tag ?? '').trim().toUpperCase();
+      lessons.push({
+        key: `${course.id}|${formatLocalDate(day)}`, date: formatLocalDate(day), weekday,
+        startsAt: startsAt.getTime(), minutes, startTime: course.startTime, endTime: course.endTime,
+        title: course.subject || course.title || course.name || '未命名课程',
+        student: course.studentName || course.student || course.name || course.title || '未命名学员',
+        studentKey: String(course.studentId || course.studentName || course.student || course.name || course.title || '未命名学员'),
+        category: Object.hasOwn(TAGS, category) ? category : 'unclassified', originalCategory: category,
+      });
+    });
+  }
+  return lessons.sort((a, b) => a.startsAt - b.startsAt || a.key.localeCompare(b.key));
+};
+const summarizeCompletedLessons = (lessons) => {
+  const groups = ['A', 'B', 'P', 'unclassified'].map(category => {
+    const items = lessons.filter(lesson => lesson.category === category);
+    const students = new Map();
+    items.forEach(lesson => {
+      if (!students.has(lesson.studentKey)) students.set(lesson.studentKey, { key: lesson.studentKey, name: lesson.student, minutes: 0, lessons: [] });
+      const student = students.get(lesson.studentKey);
+      student.minutes += lesson.minutes;
+      student.lessons.push(lesson);
+    });
+    return { category, count: items.length, minutes: items.reduce((sum, lesson) => sum + lesson.minutes, 0), students: [...students.values()] };
+  });
+  return { count: lessons.length, minutes: groups.reduce((sum, group) => sum + group.minutes, 0), groups };
+};
+
 // --- Gemini API 集成逻辑 ---
 const callGeminiAPI = async (prompt) => {
   const apiKey = ""; 
@@ -425,6 +495,42 @@ export default function App() {
   const appContainerRef = useRef(null);
   
   const [courses, setCourses] = useState(() => createDefaultSchedule(currentWeekId));
+  const [statisticsSource, setStatisticsSource] = useState(null);
+  const [statisticsNow, setStatisticsNow] = useState(() => new Date());
+  const [isStatisticsOpen, setIsStatisticsOpen] = useState(false);
+  const [statisticsDraft, setStatisticsDraft] = useState(() => getStatisticsRange('month'));
+  const [statisticsRange, setStatisticsRange] = useState(() => getStatisticsRange('month'));
+  const [statisticsError, setStatisticsError] = useState('');
+  const statisticsTriggerRef = useRef(null);
+  const statisticsCloseRef = useRef(null);
+  useEffect(() => {
+    const refresh = () => setStatisticsNow(new Date());
+    let timer;
+    const tick = () => {
+      refresh();
+      // 排课精确到分钟，在每个分钟边界刷新，避免每秒重算历史课程。
+      timer = setTimeout(tick, 60000 - Date.now() % 60000);
+    };
+    timer = setTimeout(tick, 60000 - Date.now() % 60000);
+    window.addEventListener('focus', refresh);
+    return () => { clearTimeout(timer); window.removeEventListener('focus', refresh); };
+  }, []);
+  useEffect(() => {
+    if (!isStatisticsOpen) return;
+    const trigger = statisticsTriggerRef.current;
+    statisticsCloseRef.current?.focus();
+    const handleKey = (event) => {
+      if (event.key === 'Escape') setIsStatisticsOpen(false);
+      if (event.key === 'Tab') {
+        const elements = [...statisticsCloseRef.current.closest('[role="dialog"]').querySelectorAll('button, input, summary')].filter(element => !element.disabled);
+        const first = elements[0], last = elements[elements.length - 1];
+        if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+        else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+      }
+    };
+    window.addEventListener('keydown', handleKey);
+    return () => { window.removeEventListener('keydown', handleKey); trigger?.focus(); };
+  }, [isStatisticsOpen]);
   const [viewWeekStart, setViewWeekStart] = useState(currentRealMonday);
   const [user, setUser] = useState(null);
   const [authInitialized, setAuthInitialized] = useState(false);
@@ -625,6 +731,8 @@ export default function App() {
         try {
           rawCourses = docs.map(d => ({ id: d.id, ...d.data() }));
           list = normalizeCourseDataset(rawCourses, 'firestore-snapshot', currentWeekId);
+          // 原始类别及完成状态只用于内存统计，不加入 Firestore 数据结构。
+          setStatisticsSource(rawCourses);
         } catch (error) {
           console.error('[schedule:init] Firestore data was unusable; falling back to local seed', error);
           setCourses(createDefaultSchedule(currentWeekId));
@@ -854,6 +962,36 @@ export default function App() {
     }
     return { val: t, month: m + 1 };
   }, [courses, viewWeekStart]);
+
+  const statisticsCourses = useMemo(() => {
+    const originals = new Map((statisticsSource || []).map(course => [course.id, course]));
+    return courses.map(course => {
+      const original = originals.get(course.id);
+      return original ? { ...original, ...course, category: original.category ?? original.tag ?? '' } : course;
+    });
+  }, [courses, statisticsSource]);
+  const completedSummary = useMemo(() => {
+    const monthRange = getStatisticsRange('month', statisticsNow);
+    const lessons = collectCompletedLessons(statisticsCourses, monthRange, statisticsNow);
+    const monday = getMonday(statisticsNow).getTime();
+    // 跨月的一周需要单独读取整周，不能只过滤本月记录。
+    const weekLessons = parseLocalDate(monthRange.start).getTime() > monday
+      ? collectCompletedLessons(statisticsCourses, getStatisticsRange('week', statisticsNow), statisticsNow)
+      : lessons.filter(lesson => lesson.startsAt >= monday);
+    return { week: weekLessons.reduce((sum, lesson) => sum + lesson.minutes, 0), month: lessons.reduce((sum, lesson) => sum + lesson.minutes, 0) };
+  }, [statisticsCourses, statisticsNow]);
+  const statisticsResult = useMemo(() => isStatisticsOpen
+    ? summarizeCompletedLessons(collectCompletedLessons(statisticsCourses, statisticsRange, statisticsNow))
+    : null, [statisticsCourses, statisticsRange, statisticsNow, isStatisticsOpen]);
+  const queryStatistics = (event) => {
+    event.preventDefault();
+    const start = parseLocalDate(statisticsDraft.start), end = parseLocalDate(statisticsDraft.end);
+    if (!start || !end) { setStatisticsError('请选择有效的开始日期和结束日期'); return; }
+    if (start > end) { setStatisticsError('开始日期不能晚于结束日期，请重新选择'); return; }
+    setStatisticsError('');
+    setStatisticsNow(new Date());
+    setStatisticsRange({ ...statisticsDraft });
+  };
 
   const weekDates = useMemo(() => Array.from({ length: 7 }, (_, i) => { const d = new Date(viewWeekStart); d.setDate(d.getDate() + i); return formatDate(d); }), [viewWeekStart]);
 
@@ -1619,7 +1757,7 @@ export default function App() {
 
       {!isZenMode && (
         <header className="flex-shrink-0 bg-white z-30 flex flex-col shadow-sm relative">
-          <div className="px-6 py-4 flex items-center justify-between border-b border-slate-100">
+          <div className="px-4 sm:px-6 py-4 flex flex-wrap gap-4 items-center justify-between border-b border-slate-100">
             <div className="flex items-center space-x-4">
               <div className="bg-slate-800 p-2 text-white rounded-xl shadow-md"><Calendar size={24} /></div>
               <div>
@@ -1628,14 +1766,23 @@ export default function App() {
                   {syncing ? <span className="text-[10px] text-amber-600 bg-amber-50 px-2 py-0.5 rounded border border-amber-100 flex items-center gap-1"><RefreshCw size={10} className="animate-spin"/> 同步中</span> 
                   : <span className="text-[10px] text-green-600 bg-green-50 px-2 py-0.5 rounded border border-green-100 flex items-center gap-1"><Cloud size={10}/> 已保存</span>}
                 </h1>
-                <div className="text-sm font-bold text-purple-600 flex items-center gap-4 mt-1">
+                <div className="text-sm font-bold text-purple-600 flex flex-wrap items-center gap-x-4 gap-y-2 mt-1">
                   <span>本周: ¥{String(totals.weekly)}</span>
                   <span>{String(monthlyTotal.month)}月已上: ¥{String(monthlyTotal.val)}</span>
+                  <span>本周已上课时：{formatLessonHours(completedSummary.week)}课时</span>
+                  <span>本月已上课时：{formatLessonHours(completedSummary.month)}课时</span>
+                  <button ref={statisticsTriggerRef} onClick={() => {
+                    const range = getStatisticsRange('month');
+                    setStatisticsDraft(range); setStatisticsRange(range); setStatisticsError('');
+                    setStatisticsNow(new Date()); setIsStatisticsOpen(true);
+                  }} className="inline-flex items-center gap-1 px-2 py-1 text-xs bg-indigo-50 text-indigo-600 border border-indigo-200 rounded-lg hover:bg-indigo-100">
+                    <Clock size={14} />课时统计
+                  </button>
                 </div>
               </div>
             </div>
 
-            <div className="flex items-center gap-3">
+            <div className="flex flex-wrap items-center gap-3">
               <div className={`flex items-center space-x-2 p-1 rounded-lg border mr-2 shadow-inner transition-colors ${isViewingCurrentWeek ? 'bg-indigo-50 border-indigo-200' : 'bg-slate-50 border-slate-100'}`}>
                 <button onClick={() => { const d = new Date(viewWeekStart); d.setDate(d.getDate()-7); setViewWeekStart(d); }} className="p-1.5 rounded-md hover:bg-white shadow-sm transition-all text-slate-600"><ChevronLeft size={20} /></button>
                 <span className={`text-sm font-bold w-32 text-center tracking-wide ${isViewingCurrentWeek ? 'text-indigo-700' : 'text-slate-800'}`}>
@@ -1698,6 +1845,55 @@ export default function App() {
             </div>
           </div>
         </header>
+      )}
+
+      {isStatisticsOpen && statisticsResult && (
+        <div className="fixed inset-0 z-[10000] bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-3 sm:p-6" onClick={event => { if (event.target === event.currentTarget) setIsStatisticsOpen(false); }}>
+          <section role="dialog" aria-modal="true" aria-labelledby="lesson-statistics-title" className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[90dvh] flex flex-col overflow-hidden">
+            <header className="flex items-center justify-between px-5 py-4 border-b border-slate-100 shrink-0">
+              <h2 id="lesson-statistics-title" className="text-lg font-black flex items-center gap-2"><Clock size={20} className="text-indigo-600" />课时统计</h2>
+              <button ref={statisticsCloseRef} onClick={() => setIsStatisticsOpen(false)} className="flex items-center gap-1 px-3 py-2 rounded-lg text-slate-600 hover:bg-slate-100"><X size={18} />关闭</button>
+            </header>
+            <div className="overflow-y-auto p-4 sm:p-6 space-y-5">
+              <form onSubmit={queryStatistics} className="space-y-3">
+                <div className="grid grid-cols-1 sm:grid-cols-[1fr_1fr_auto] gap-3 items-end">
+                  <label className="font-bold text-slate-600 space-y-1 block">开始日期<input type="date" required value={statisticsDraft.start} onChange={event => setStatisticsDraft({ ...statisticsDraft, start: event.target.value })} className="block w-full min-w-0 px-3 py-2 rounded-lg border border-slate-200 bg-slate-50" /></label>
+                  <label className="font-bold text-slate-600 space-y-1 block">结束日期<input type="date" required value={statisticsDraft.end} onChange={event => setStatisticsDraft({ ...statisticsDraft, end: event.target.value })} className="block w-full min-w-0 px-3 py-2 rounded-lg border border-slate-200 bg-slate-50" /></label>
+                  <button type="submit" className="bg-indigo-600 text-white px-5 py-2 rounded-lg font-bold hover:bg-indigo-700">查询</button>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {[['week', '本周'], ['month', '本月'], ['lastMonth', '上月']].map(([preset, label]) => <button key={preset} type="button" onClick={() => { const range = getStatisticsRange(preset); setStatisticsDraft(range); setStatisticsRange(range); setStatisticsError(''); setStatisticsNow(new Date()); }} className="px-3 py-1.5 rounded-lg border border-indigo-100 bg-indigo-50 text-indigo-600 font-bold">{label}</button>)}
+                </div>
+                {statisticsError && <p role="alert" className="text-red-600 bg-red-50 p-3 rounded-lg">{statisticsError}</p>}
+              </form>
+              <div aria-live="polite" className="bg-indigo-50 border border-indigo-100 rounded-xl p-4">
+                <p className="font-bold text-slate-600">{formatStatisticsDate(statisticsRange.start)}—{formatStatisticsDate(statisticsRange.end)}</p>
+                <p className="text-lg font-black text-indigo-700 mt-2">共上课{statisticsResult.count}次｜总计{formatLessonHours(statisticsResult.minutes)}课时</p>
+                <p className="text-xs text-slate-500 mt-2">按本地时间统计已结束课程；1小时＝1课时。未来和进行中的课程不计入。</p>
+              </div>
+              {statisticsResult.count === 0 ? <p className="text-center text-slate-500 py-8">所选日期范围内暂无已完成课程</p> : statisticsResult.groups.map(group => (
+                <details key={group.category} open className={`rounded-xl border ${TAGS[group.category]?.theme.border || 'border-slate-200'} ${TAGS[group.category]?.theme.bg || 'bg-slate-50'}`}>
+                  <summary className="cursor-pointer p-4 font-bold">
+                    <span className="text-base">{group.category === 'unclassified' ? '未分类' : `${group.category}类`}</span>
+                    <span className="block text-xs text-slate-600 mt-1">{group.count}次课程｜{formatLessonHours(group.minutes)}课时｜{group.students.length}名学员</span>
+                  </summary>
+                  <div className="px-3 pb-3 space-y-2">
+                    {group.students.map(student => <details key={student.key} className="bg-white/90 border border-white rounded-lg">
+                      <summary className="p-3 cursor-pointer font-bold">{student.name}<span className="block text-xs font-medium text-slate-500 mt-1">{student.lessons.length}次课程｜{formatLessonHours(student.minutes)}课时</span></summary>
+                      <ol className="px-3 pb-3 divide-y divide-slate-100">
+                        {student.lessons.map(lesson => <li key={lesson.key} className="py-3 space-y-1 text-slate-600">
+                          <p className="font-bold">{formatStatisticsDate(lesson.date)} 星期{['一', '二', '三', '四', '五', '六', '日'][lesson.weekday]}</p>
+                          <p>{lesson.startTime}—{lesson.endTime}</p>
+                          <p className="break-words">{lesson.title}｜{lesson.category === 'unclassified' ? `未分类${lesson.originalCategory ? `（${lesson.originalCategory}）` : ''}` : `${lesson.category}类`}｜{formatLessonHours(lesson.minutes)}课时</p>
+                        </li>)}
+                      </ol>
+                    </details>)}
+                  </div>
+                </details>
+              ))}
+            </div>
+          </section>
+        </div>
       )}
 
       <div className={`flex-1 overflow-auto relative transition-colors duration-300 ${isViewingCurrentWeek ? 'bg-indigo-50/80' : 'bg-slate-100/70'} ${isZenMode || isCssFullscreen ? 'p-0' : 'p-6'}`}>

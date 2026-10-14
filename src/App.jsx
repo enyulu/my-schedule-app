@@ -1769,13 +1769,15 @@ export default function App() {
                 <div className="text-sm font-bold text-purple-600 flex flex-wrap items-center gap-x-4 gap-y-2 mt-1">
                   <span>本周: ¥{String(totals.weekly)}</span>
                   <span>{String(monthlyTotal.month)}月已上: ¥{String(monthlyTotal.val)}</span>
+                </div>
+                <div className="text-sm font-bold text-teal-700 flex flex-wrap items-center gap-x-4 gap-y-2 mt-2">
                   <span>本周已上课时：{formatLessonHours(completedSummary.week)}课时</span>
                   <span>本月已上课时：{formatLessonHours(completedSummary.month)}课时</span>
                   <button ref={statisticsTriggerRef} onClick={() => {
                     const range = getStatisticsRange('month');
                     setStatisticsDraft(range); setStatisticsRange(range); setStatisticsError('');
                     setStatisticsNow(new Date()); setIsStatisticsOpen(true);
-                  }} className="inline-flex items-center gap-1 px-2 py-1 text-xs bg-indigo-50 text-indigo-600 border border-indigo-200 rounded-lg hover:bg-indigo-100">
+                  }} className="inline-flex items-center gap-1 px-2 py-1 text-xs bg-teal-50 text-teal-700 border border-teal-200 rounded-lg hover:bg-teal-100">
                     <Clock size={14} />课时统计
                   </button>
                 </div>

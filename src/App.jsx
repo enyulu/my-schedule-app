@@ -1,4 +1,5 @@
 import { useState, useMemo, useEffect, useRef, useCallback } from 'react';
+import { clampScheduleZoom, getScheduleFitPercent, getScheduleGridPoint, getScheduleStartMinutes } from './scheduleZoom';
 import { Calendar, ChevronLeft, ChevronRight, ChevronDown, Plus, X, Clock, AlertCircle, Download, RefreshCw, Cloud, Copy, FileSpreadsheet, Layers, Settings2, Undo, Database, AlignLeft, Sparkles, Bot, Maximize2, Minimize2, LogOut, Lock, Mail } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut } from 'firebase/auth';
@@ -493,6 +494,22 @@ export default function App() {
   const scheduleRef = useRef(null);
   const gridBodyRef = useRef(null); 
   const appContainerRef = useRef(null);
+  const scheduleViewportRef = useRef(null);
+  const [scheduleViewportWidth, setScheduleViewportWidth] = useState(1000);
+  const [zoomPreference, setZoomPreference] = useState(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem('schedule-display-zoom'));
+      return { mode: saved?.mode === 'fit' ? 'fit' : 'manual', percent: clampScheduleZoom(saved?.percent) };
+    } catch { return { mode: 'manual', percent: 100 }; }
+  });
+  const scheduleWidth = Math.max(1000, Math.min(1400, scheduleViewportWidth));
+  const scheduleZoom = zoomPreference.mode === 'fit'
+    ? getScheduleFitPercent(scheduleViewportWidth, scheduleWidth)
+    : zoomPreference.percent;
+  useEffect(() => {
+    try { localStorage.setItem('schedule-display-zoom', JSON.stringify(zoomPreference)); }
+    catch { /* Display controls remain usable when browser storage is unavailable. */ }
+  }, [zoomPreference]);
   
   const [courses, setCourses] = useState(() => createDefaultSchedule(currentWeekId));
   const [statisticsSource, setStatisticsSource] = useState(null);
@@ -541,6 +558,13 @@ export default function App() {
   const [isZenMode, setIsZenMode] = useState(false);
   const [isNativeFullscreen, setIsNativeFullscreen] = useState(false);
   const [isCssFullscreen, setIsCssFullscreen] = useState(false);
+  useEffect(() => {
+    const viewport = scheduleViewportRef.current;
+    if (!viewport) return;
+    const observer = new ResizeObserver(([entry]) => setScheduleViewportWidth(entry.contentRect.width));
+    observer.observe(viewport);
+    return () => observer.disconnect();
+  }, [authInitialized, user, isZenMode, isCssFullscreen]);
   
   // -- Auth UI States (for standalone mode) --
   const [authEmail, setAuthEmail] = useState('');
@@ -1082,21 +1106,17 @@ export default function App() {
       if (!gridBodyRef.current || !user) { setDragInfo(null); return; }
       
       const rect = gridBodyRef.current.getBoundingClientRect();
-      let x = e.clientX - rect.left - 65; 
-      let y = e.clientY - rect.top;
-
-      if (x < 0 || x > rect.width - 65 || y < 0 || y > rect.height) { setDragInfo(null); return; }
-
-      const colWidth = (rect.width - 65) / 7;
-      const colIdx = Math.max(0, Math.min(6, Math.floor(x / colWidth)));
-
-      let dropMins = ((e.clientY - dragInfo.offsetY - rect.top) / PIXELS_PER_HOUR) * 60 + START_HOUR * 60;
-      dropMins = Math.round(dropMins / 15) * 15; 
+      const scale = rect.width / gridBodyRef.current.offsetWidth;
+      const point = getScheduleGridPoint({ clientX: e.clientX, clientY: e.clientY, rect, scale });
+      if (!point) { setDragInfo(null); return; }
+      const colIdx = point.colIndex;
 
       const durMins = timeToMinutes(course.endTime) - timeToMinutes(course.startTime);
       const actualDur = durMins > 0 ? durMins : durMins + 1440;
       
-      const newStartMins = Math.max(START_HOUR * 60, Math.min(END_HOUR * 60 - actualDur, dropMins));
+      const newStartMins = getScheduleStartMinutes(point.y - dragInfo.offsetY / scale, {
+        startHour: START_HOUR, endHour: END_HOUR, pixelsPerHour: PIXELS_PER_HOUR, duration: actualDur, snap: 'round',
+      });
       const newStartTime = minutesToTime(newStartMins);
       const newEndTime = minutesToTime(newStartMins + actualDur);
       
@@ -1844,6 +1864,12 @@ export default function App() {
               <button onClick={toggleFullscreen} className="px-3 py-2.5 bg-white text-slate-600 border border-slate-200 rounded-lg text-sm font-bold shadow-sm hover:bg-slate-50 transition-all" title="全屏显示网页">
                 <Maximize2 size={16} />
               </button>
+              <div role="group" aria-label="课表显示比例" className="flex items-center gap-1 p-1 bg-white border border-slate-200 rounded-lg shadow-sm">
+                <button type="button" aria-label="缩小课表" title="缩小10%" disabled={scheduleZoom <= 60} onClick={() => setZoomPreference({ mode: 'manual', percent: clampScheduleZoom(scheduleZoom - 10) })} className="w-9 h-9 rounded-md font-bold text-lg hover:bg-slate-100 disabled:opacity-30 disabled:cursor-not-allowed">−</button>
+                <button type="button" aria-label={`当前比例${scheduleZoom}%，点击恢复100%`} title="恢复100%" onClick={() => setZoomPreference({ mode: 'manual', percent: 100 })} className="min-w-14 h-9 px-1 rounded-md font-bold text-indigo-600 hover:bg-indigo-50 tabular-nums">{scheduleZoom}%</button>
+                <button type="button" aria-label="放大课表" title="放大10%" disabled={scheduleZoom >= 140} onClick={() => setZoomPreference({ mode: 'manual', percent: clampScheduleZoom(scheduleZoom + 10) })} className="w-9 h-9 rounded-md font-bold text-lg hover:bg-slate-100 disabled:opacity-30 disabled:cursor-not-allowed">＋</button>
+                <button type="button" aria-pressed={zoomPreference.mode === 'fit'} title="按窗口宽度调整，最小60%；窄屏可横向滚动" onClick={() => setZoomPreference({ mode: 'fit', percent: scheduleZoom })} className={`h-9 px-2 rounded-md text-xs font-bold ${zoomPreference.mode === 'fit' ? 'bg-indigo-50 text-indigo-700' : 'text-slate-600 hover:bg-slate-100'}`}>适应窗口</button>
+              </div>
               
               <button onClick={toggleZenMode} className="px-3 py-2.5 bg-white text-slate-600 border border-slate-200 rounded-lg text-sm font-bold shadow-sm hover:bg-slate-50 transition-all" title="隐藏菜单栏">
                 <AlignLeft size={16} />
@@ -1945,7 +1971,7 @@ export default function App() {
         </div>
       )}
 
-      <div className={`flex-1 overflow-auto relative transition-colors duration-300 ${isViewingCurrentWeek ? 'bg-indigo-50/80' : 'bg-slate-100/70'} ${isZenMode || isCssFullscreen ? 'p-0' : 'p-6'}`}>
+      <div ref={scheduleViewportRef} className={`flex-1 min-h-0 overflow-auto relative transition-colors duration-300 ${isViewingCurrentWeek ? 'bg-indigo-50/80' : 'bg-slate-100/70'} ${isZenMode || isCssFullscreen ? 'p-0' : 'p-6'}`}>
         
         {courses.length === 0 && !syncing && !hideEmptyOverlay && (
           <div className="absolute inset-0 z-[100] flex items-center justify-center bg-slate-900/60 backdrop-blur-md p-4 animate-in fade-in">
@@ -1975,7 +2001,7 @@ export default function App() {
           </div>
         )}
         
-        <div ref={scheduleRef} onContextMenu={e => e.preventDefault()} className={`min-w-[1000px] max-w-[1400px] mx-auto bg-white flex flex-col relative border transition-all ${isViewingCurrentWeek ? 'shadow-xl shadow-indigo-200/50 border-indigo-300 ring-4 ring-indigo-100' : 'shadow-sm border-slate-200'}`}>
+        <div ref={scheduleRef} style={{ width: scheduleWidth, zoom: scheduleZoom / 100 }} onContextMenu={e => e.preventDefault()} className={`mx-auto bg-white flex flex-col relative border transition-colors ${isViewingCurrentWeek ? 'shadow-xl shadow-indigo-200/50 border-indigo-300 ring-4 ring-indigo-100' : 'shadow-sm border-slate-200'}`}>
           {isViewingCurrentWeek && (
             <div className="bg-gradient-to-r from-indigo-600 to-violet-500 text-white text-center py-1.5 text-[11px] font-black tracking-[0.3em] sticky top-0 z-[45]">
               当前周课表
@@ -2018,10 +2044,9 @@ export default function App() {
                     onClick={(e) => { 
                       if (e.target === e.currentTarget) {
                         const rect = e.currentTarget.getBoundingClientRect();
-                        const y = e.clientY - rect.top;
-                        let clickMins = (y / PIXELS_PER_HOUR) * 60 + START_HOUR * 60;
-                        clickMins = Math.floor(clickMins / 15) * 15;
-                        clickMins = Math.max(START_HOUR * 60, Math.min(END_HOUR * 60 - 60, clickMins)); 
+                        const scale = rect.height / e.currentTarget.offsetHeight;
+                        const y = (e.clientY - rect.top) / scale;
+                        const clickMins = getScheduleStartMinutes(y, { startHour: START_HOUR, endHour: END_HOUR, pixelsPerHour: PIXELS_PER_HOUR });
                         openModal(null, colIdx, minutesToTime(clickMins));
                       }
                     }}>

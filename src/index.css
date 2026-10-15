@@ -48,3 +48,69 @@ button {
 ::-webkit-scrollbar-thumb:hover {
   background: #94a3b8;
 }
+
+.p-course-celebration {
+  position: fixed;
+  inset: 0;
+  z-index: 10020;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+  user-select: none;
+  color: #fbbf24;
+  animation: p-course-celebrate 1s ease-out both;
+}
+
+.p-course-celebration--flower { color: #c084fc; }
+
+.p-course-celebration__art {
+  width: min(55vw, 240px);
+  height: auto;
+  overflow: visible;
+  filter: drop-shadow(0 0 12px #fbbf2480);
+}
+
+.p-course-celebration--flower .p-course-celebration__art {
+  filter: drop-shadow(0 0 12px #c084fc80);
+}
+
+.p-course-celebration__petal {
+  transform-box: fill-box;
+  transform-origin: 50% 100%;
+  animation: p-flower-bloom 1s cubic-bezier(.2,.8,.3,1) both;
+}
+
+.p-course-celebration__sparkle {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: p-ingot-sparkle .5s ease-in-out 2 both;
+}
+
+@keyframes p-course-celebrate {
+  0% { opacity: 0; transform: translateY(14px) scale(.5); }
+  22% { opacity: 1; transform: translateY(0) scale(1.08); }
+  40%, 72% { opacity: 1; transform: translateY(0) scale(1); }
+  100% { opacity: 0; transform: translateY(-28px) scale(1.08); }
+}
+
+@keyframes p-flower-bloom {
+  0% { transform: scale(.05); }
+  50% { transform: scale(1.05); }
+  75%, 100% { transform: scale(1); }
+}
+
+@keyframes p-ingot-sparkle {
+  0%, 100% { opacity: 0; transform: scale(.2) rotate(-20deg); }
+  50% { opacity: 1; transform: scale(1.2) rotate(20deg); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .p-course-celebration { animation-name: p-course-celebrate-gentle; }
+  .p-course-celebration__petal,
+  .p-course-celebration__sparkle { animation: none; }
+}
+
+@keyframes p-course-celebrate-gentle {
+  0%, 100% { opacity: 0; }
+  20%, 80% { opacity: 1; }
+}

@@ -552,6 +552,12 @@ export default function App() {
   // -- UI States --
   const [isDownloading, setIsDownloading] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const [courseCelebration, setCourseCelebration] = useState(null);
+  useEffect(() => {
+    if (!courseCelebration) return;
+    const timer = setTimeout(() => setCourseCelebration(null), 1000);
+    return () => clearTimeout(timer);
+  }, [courseCelebration]);
   const [editingCourseId, setEditingCourseId] = useState(null);
   const [formData, setFormData] = useState({ title: '', colIndex: 0, startTime: '10:00', duration: 60, value: 0, recurrence: 'temp', excludedWeeks: [], tag: 'P', notes: '' });
   const [isLessonSettingsModalOpen, setIsLessonSettingsModalOpen] = useState(false);
@@ -1529,6 +1535,9 @@ export default function App() {
       }
       await batch.commit();
       setIsModalOpen(false);
+      if ((!editingCourseId || isDuplicate) && validatedCourse.category === 'P') {
+        setCourseCelebration({ type: validatedCourse.isFixed ? 'flower' : 'ingot', id: targetId });
+      }
     } catch (error) {
       logFirestoreError('course:save', error);
       setRestoreError(`课程保存失败：${error.message}`);
@@ -1748,6 +1757,44 @@ export default function App() {
   // --- 主界面 ---
   return (
     <div ref={appContainerRef} className={`flex flex-col text-slate-800 font-sans text-[13px] transition-all duration-300 ${isCssFullscreen ? 'fixed inset-0 z-[9999] w-screen h-screen m-0 p-0 overflow-hidden bg-white' : 'h-screen bg-white'}`}>
+      {courseCelebration && (
+        <div key={courseCelebration.id} aria-hidden="true" className={`p-course-celebration p-course-celebration--${courseCelebration.type}`}>
+          <svg viewBox="0 0 200 200" fill="none" className="p-course-celebration__art">
+            <defs>
+              <linearGradient id="p-ingot-gold" x1="70" y1="70" x2="130" y2="155" gradientUnits="userSpaceOnUse">
+                <stop stopColor="#fff6ae" /><stop offset=".4" stopColor="#facc15" /><stop offset="1" stopColor="#d97706" />
+              </linearGradient>
+              <radialGradient id="p-flower-purple">
+                <stop stopColor="#f5d0fe" /><stop offset=".65" stopColor="#c084fc" /><stop offset="1" stopColor="#7e22ce" />
+              </radialGradient>
+            </defs>
+            {courseCelebration.type === 'ingot' ? (
+              <g className="p-course-celebration__ingot">
+                <path d="M27 87 Q46 98 58 111 Q100 127 142 111 Q154 98 173 87 L153 142 Q100 172 47 142 Z" fill="url(#p-ingot-gold)" stroke="#d97706" strokeWidth="3" strokeLinejoin="round" />
+                <path d="M27 87 Q53 78 72 98 Q100 109 128 98 Q147 78 173 87 Q157 121 100 129 Q43 121 27 87Z" fill="#fde047" stroke="#eab308" strokeWidth="3" />
+                <ellipse cx="100" cy="104" rx="32" ry="14" fill="#d97706" />
+                <path d="M72 102 Q73 69 100 68 Q127 69 128 102 Q101 117 72 102Z" fill="url(#p-ingot-gold)" stroke="#f59e0b" strokeWidth="2" />
+                <path d="M81 87 Q89 77 100 77 M58 137 Q77 147 99 147" stroke="#fff7c2" strokeWidth="5" strokeLinecap="round" />
+              </g>
+            ) : (
+              <g>
+                {[0, 45, 90, 135, 180, 225, 270, 315].map(angle => (
+                  <g key={angle} transform={`rotate(${angle} 100 100)`}>
+                    <ellipse className="p-course-celebration__petal" cx="100" cy="68" rx="18" ry="37" fill="url(#p-flower-purple)" stroke="#e9d5ff" strokeWidth="1.5" />
+                  </g>
+                ))}
+                <circle cx="100" cy="100" r="17" fill="#fde68a" stroke="#fbbf24" strokeWidth="3" />
+                <circle cx="95" cy="95" r="5" fill="#fffbeb" />
+              </g>
+            )}
+            {[[29, 49], [156, 43], [178, 115], [30, 157], [138, 170], [99, 22]].map(([x, y], index) => (
+              <g key={index} transform={`translate(${x} ${y})`}>
+                <path className="p-course-celebration__sparkle" style={{ animationDelay: `${index * 35}ms` }} d="M0 -10 Q1 -1 10 0 Q1 1 0 10 Q-1 1 -10 0 Q-1 -1 0 -10Z" fill="currentColor" />
+              </g>
+            ))}
+          </svg>
+        </div>
+      )}
       
       {isZenMode && (
         <button onClick={toggleZenMode} className="fixed bottom-8 right-8 z-[100] bg-slate-800 text-white px-5 py-3 rounded-2xl shadow-2xl flex items-center gap-2 hover:bg-slate-700 transition-all font-black border border-slate-600 animate-in zoom-in-50">

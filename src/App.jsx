@@ -1091,7 +1091,7 @@ export default function App() {
     if (e.target.closest('button')) return;
     e.stopPropagation(); e.preventDefault(); 
     const rect = e.currentTarget.getBoundingClientRect();
-    setDragInfo({ course, action: e.button === 2 ? 'copy' : 'move', startX: e.clientX, startY: e.clientY, currX: e.clientX, currY: e.clientY, offsetX: e.clientX - rect.left, offsetY: e.clientY - rect.top, width: rect.width, height: rect.height });
+    setDragInfo({ course, action: e.button === 2 ? 'copy' : 'move', startX: e.clientX, startY: e.clientY, currX: e.clientX, currY: e.clientY, offsetX: e.clientX - rect.left, offsetY: e.clientY - rect.top, width: rect.width, height: rect.height, scale: rect.width / e.currentTarget.offsetWidth });
   };
 
   useEffect(() => {
@@ -2061,78 +2061,36 @@ export default function App() {
                       const hasOverlap = group.length > 1;
                       const startPx = ((course.startM - START_HOUR * 60) / 60) * PIXELS_PER_HOUR;
                       const heightPx = ((course.endM - course.startM) / 60) * PIXELS_PER_HOUR;
-                      const isCompact = heightPx <= 50;
+                      const isCompact = heightPx < PIXELS_PER_HOUR;
+                      const displayInfo = getCourseDisplayInfo(course, viewWeekId);
+                      const finalNotes = [displayInfo.dynamicNote, course.notes].filter(Boolean).join(' | ');
 
                       return (
                         <div key={course.id} 
                           onMouseDown={(e) => handleCourseMouseDown(e, course)}
-                          className={`absolute p-3 rounded-2xl cursor-grab active:cursor-grabbing transition-all duration-300 hover:scale-[1.01] flex flex-col shadow-sm group/card
+                          title={`${displayInfo.title} · ${course.startTime}—${course.endTime}${finalNotes ? ` · ${finalNotes}` : ''}`}
+                          className={`schedule-course-card absolute rounded-2xl cursor-grab active:cursor-grabbing transition-all duration-300 hover:scale-[1.01] flex flex-col shadow-sm group/card ${isCompact ? 'p-1 gap-0.5' : 'p-2 gap-0.5'}
                             ${theme.bg} ${theme.text}
                             ${!course.isFixed ? `border-[1.5px] border-dashed ${theme.border}` : course.isBiweekly ? `border-[1.5px] border-dotted ${theme.border}` : `border border-solid ${theme.border}`}
                           `}
                           style={{ top: `${startPx + 2}px`, height: `${heightPx - 4}px`, zIndex: 20, left: '4px', right: '4px' }}>
                           
-                          {isCompact ? (
-                            <>
-                              <span className={`w-4 h-4 flex-shrink-0 flex items-center justify-center rounded-full text-[8px] font-black shadow-sm text-white ${TAGS[course.tag || 'P']?.badge.split(' ')[0]}`}>{String(course.tag)}</span>
-                              <span className="font-black text-[12px] truncate tracking-tight ml-1.5">{String(getCourseDisplayInfo(course, viewWeekId).title)}</span>
-                              {(!course.isFixed || course.isBiweekly || hasOverlap) && (
-                                <div className="flex items-center gap-0.5 ml-auto pl-1">
-                                  {!course.isFixed && <span className="bg-white text-slate-800 border border-slate-200 px-1 py-0.5 rounded-[4px] text-[7px] font-black leading-none">临时</span>}
-                                  {course.isBiweekly && <span className="bg-white text-slate-800 border border-slate-200 px-1 py-0.5 rounded-[4px] text-[7px] font-black leading-none">隔周</span>}
-                                  {hasOverlap && <button onClick={(e) => { e.stopPropagation(); setOverlapState(prev => ({...prev, [stateKey]: (activeIdx+1)%group.length})); }} className="bg-white/90 px-1 py-0.5 rounded-[4px] text-[7px] font-black border border-black/5 flex items-center gap-0.5"><Layers size={8}/>{activeIdx+1}</button>}
-                                </div>
-                              )}
-                              <span className="ml-auto text-[10px] font-black text-black/30 tracking-wider pr-1">¥{String(getCourseTotalValue(course, new Date(viewWeekStart.getTime() + colIdx * 86400000)))}</span>
-                            </>
-                          ) : (
-                            <>
-                              <div className="flex items-start justify-between relative">
-                                <div className="flex items-center gap-1.5">
-                                  <span className={`w-[18px] h-[18px] flex items-center justify-center rounded-full text-[9px] font-black text-white shadow-sm ${TAGS[course.tag || 'P']?.badge.split(' ')[0]}`}>{String(course.tag)}</span>
-                                  <span className="text-[10px] font-bold opacity-60 tracking-tight">{String(course.startTime)}-{String(course.endTime)}</span>
-                                </div>
-                                <div className="flex flex-col items-end gap-1 relative z-30">
-                                  <button onClick={(e) => { e.stopPropagation(); performDelete(course.id); }} className="opacity-0 group-hover/card:opacity-100 absolute top-0 right-0 p-0.5 text-slate-400 hover:text-red-500 transition-colors"><X size={14}/></button>
-                                  <div className="group-hover/card:opacity-0 transition-opacity flex flex-col items-center leading-[1.1] text-[9px] text-slate-500 font-bold bg-white/60 px-1 py-0.5 rounded shadow-sm border border-black/5">
-                                    {!course.isFixed && <><span className="block">临</span><span className="block">时</span></>}
-                                    {course.isBiweekly && <><span className="block">隔</span><span className="block">周</span></>}
-                                  </div>
-                                </div>
-                              </div>
-
-                              <div className="mt-1 font-black text-[14px] leading-tight truncate pr-2 pointer-events-none text-slate-900">
-                                {String(getCourseDisplayInfo(course, viewWeekId).title)}
-                              </div>
-
-                              {(() => {
-                                const { dynamicNote } = getCourseDisplayInfo(course, viewWeekId);
-                                const finalNotes = [dynamicNote, course.notes].filter(Boolean).join(' | ');
-                                return finalNotes ? (
-                                  <div className="relative group/note mt-0.5 pointer-events-none">
-                                    <div className="text-[10px] font-bold opacity-60 leading-tight w-fit pointer-events-auto cursor-help">
-                                      {finalNotes.length > 8 ? finalNotes.slice(0, 8) + '...' : finalNotes}
-                                    </div>
-                                    {finalNotes.length > 8 && (
-                                      <div className="absolute bottom-full left-0 mb-1.5 hidden group-hover/note:block z-[60] w-max max-w-[180px] bg-slate-800 text-white text-[11px] font-bold p-2.5 rounded-xl shadow-xl whitespace-normal break-words pointer-events-none leading-relaxed animate-in fade-in slide-in-from-bottom-1">
-                                        {finalNotes}
-                                        <div className="absolute -bottom-1 left-3 w-2 h-2 bg-slate-800 rotate-45"></div>
-                                      </div>
-                                    )}
-                                  </div>
-                                ) : null;
-                              })()}
-                              
-                              <div className="absolute bottom-2 right-3 text-[10px] font-black text-black/30 tracking-wider pointer-events-none">¥ {String(getCourseTotalValue(course, new Date(viewWeekStart.getTime() + colIdx * 86400000)))}</div>
-                              
-                              {hasOverlap && (
-                                <button onClick={(e) => { e.stopPropagation(); setOverlapState(prev => ({...prev, [stateKey]: (activeIdx+1)%group.length})); }}
-                                  className="absolute bottom-2 left-2 flex items-center gap-0.5 px-1.5 py-0.5 rounded-md bg-white/80 hover:bg-white text-[9px] font-bold border border-black/5 shadow-sm text-slate-600 transition-colors z-30">
-                                  <Layers size={10}/> {String(activeIdx+1)}/{String(group.length)}
-                                </button>
-                              )}
-                            </>
-                          )}
+                          <div className="flex items-center gap-1 shrink-0 min-w-0">
+                            <span className={`shrink-0 flex items-center justify-center rounded-full font-black text-white ${isCompact ? 'w-2.5 h-2.5 text-[6px]' : 'w-3.5 h-3.5 text-[8px]'} ${TAGS[course.tag || 'P']?.badge.split(' ')[0]}`}>{String(course.tag)}</span>
+                            <span className={`min-w-0 whitespace-nowrap font-bold text-slate-500 tracking-tight ${isCompact ? 'text-[7px] leading-[10px]' : 'text-[10px] leading-[14px]'}`}>{course.startTime}—{course.endTime}</span>
+                            {(!course.isFixed || course.isBiweekly) && (!isCompact || !hasOverlap) && <span className="ml-auto shrink-0 text-[7px] leading-[10px] text-slate-500 bg-white/80 rounded px-0.5 group-hover/card:opacity-0">{course.isBiweekly ? '隔周' : '临时'}</span>}
+                            {isCompact && hasOverlap && <button onClick={e => { e.stopPropagation(); setOverlapState(prev => ({ ...prev, [stateKey]: (activeIdx + 1) % group.length })); }} className="ml-auto shrink-0 flex items-center gap-0.5 rounded bg-white/80 text-[7px] leading-[10px] font-bold"><Layers size={7} />{activeIdx + 1}/{group.length}</button>}
+                            <button aria-label={`删除课程${course.title}`} onClick={e => { e.stopPropagation(); performDelete(course.id); }} className="absolute top-1 right-1 p-0.5 rounded bg-white opacity-0 group-hover/card:opacity-100 focus:opacity-100 text-slate-400 hover:text-red-500"><X size={isCompact ? 10 : 12} /></button>
+                          </div>
+                          <div className={`flex items-center gap-1 shrink-0 min-w-0 ${isCompact ? 'mt-auto' : ''}`}>
+                            <div className={`schedule-course-title min-w-0 flex-1 truncate font-black pointer-events-none text-slate-900 ${isCompact ? 'text-[10px] leading-[12px]' : 'text-[14px] leading-[18px]'}`}>{String(displayInfo.title)}</div>
+                            {isCompact && <span className="schedule-course-price shrink-0 text-[8px] leading-[12px] font-bold text-slate-500">¥{getCourseTotalValue(course, new Date(viewWeekStart.getTime() + colIdx * 86400000))}</span>}
+                          </div>
+                          {!isCompact && finalNotes && <div className="schedule-course-notes shrink-0 min-w-0 truncate text-[10px] leading-[12px] font-bold text-slate-500">{finalNotes}</div>}
+                          {!isCompact && <div className="flex items-center justify-between gap-1 mt-auto shrink-0 min-w-0">
+                            {hasOverlap ? <button onClick={e => { e.stopPropagation(); setOverlapState(prev => ({ ...prev, [stateKey]: (activeIdx + 1) % group.length })); }} className="flex items-center gap-0.5 px-1 rounded bg-white/80 border border-black/5 text-[8px] leading-[10px] font-bold text-slate-600"><Layers size={8} />{activeIdx + 1}/{group.length}</button> : <span />}
+                            {!isCompact && <span className="schedule-course-price text-[10px] leading-[12px] font-black text-slate-500">¥ {getCourseTotalValue(course, new Date(viewWeekStart.getTime() + colIdx * 86400000))}</span>}
+                          </div>}
                         </div>
                       );
                     })}
@@ -2151,12 +2109,12 @@ export default function App() {
             ${TAGS[dragInfo.course.tag || 'P']?.theme.text} 
             ${TAGS[dragInfo.course.tag || 'P']?.theme.border}
           `}
-          style={{ left: dragInfo.currX - dragInfo.offsetX, top: dragInfo.currY - dragInfo.offsetY, width: dragInfo.width, height: dragInfo.height }}
+          style={{ left: dragInfo.currX - dragInfo.offsetX, top: dragInfo.currY - dragInfo.offsetY, width: dragInfo.width, height: dragInfo.height, padding: 12 * dragInfo.scale }}
         >
           <div className="absolute -top-3 left-1/2 -translate-x-1/2 bg-slate-800 text-white text-[10px] px-3 py-1 rounded-full font-bold shadow-md whitespace-nowrap animate-bounce">
             {dragInfo.action === 'copy' ? '➕ 复制至新时间' : '✥ 移动至新时间'}
           </div>
-          <div className="font-black text-[12px] opacity-70">
+          <div className="font-black opacity-70" style={{ fontSize: 12 * dragInfo.scale }}>
             {dragInfo.course.title.replace(/\s*\(第\d+课\)/g, '')}
           </div>
         </div>

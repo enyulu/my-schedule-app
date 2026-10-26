@@ -31,6 +31,12 @@ button {
   cursor: pointer;
 }
 
+/* Keep browser text inflation from counteracting the timetable's own zoom. */
+.schedule-course-card {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;

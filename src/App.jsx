@@ -1,6 +1,7 @@
 import { useState, useMemo, useEffect, useRef, useCallback } from 'react';
 import { clampScheduleZoom, getScheduleFitPercent, getScheduleGridPoint, getScheduleStartMinutes } from './scheduleZoom';
-import { Calendar, ChevronLeft, ChevronRight, ChevronDown, Plus, X, Clock, AlertCircle, Download, RefreshCw, Cloud, Copy, FileSpreadsheet, Layers, Settings2, Undo, Database, AlignLeft, Sparkles, Bot, Maximize2, Minimize2, LogOut, Lock, Mail } from 'lucide-react';
+import MonthlyReports from './MonthlyReports.jsx';
+import { Calendar, ChevronLeft, ChevronRight, ChevronDown, Plus, X, Clock, AlertCircle, Download, RefreshCw, Cloud, Copy, FileSpreadsheet, BarChart3, Layers, Settings2, Undo, Database, AlignLeft, Sparkles, Bot, Maximize2, Minimize2, LogOut, Lock, Mail } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut } from 'firebase/auth';
 import { getFirestore, collection, doc, setDoc, deleteDoc, onSnapshot, updateDoc, arrayUnion, writeBatch, getDocs, getDoc } from 'firebase/firestore';
@@ -133,7 +134,7 @@ const getStatisticsRange = (preset, now = new Date()) => {
   const end = preset === 'lastMonth' ? new Date(now.getFullYear(), now.getMonth(), 0) : now;
   return { start: formatLocalDate(start), end: formatLocalDate(end) };
 };
-const collectCompletedLessons = (courses, range, now) => {
+const collectCompletedLessons = (courses, range, now, { includeUnfinished = false } = {}) => {
   const start = parseLocalDate(range.start), end = parseLocalDate(range.end);
   if (!start || !end || start > end) return [];
   end.setHours(23, 59, 59, 999);
@@ -156,11 +157,11 @@ const collectCompletedLessons = (courses, range, now) => {
       startsAt.setMinutes(startMinutes);
       const endsAt = new Date(day);
       endsAt.setMinutes(startMinutes + minutes);
-      if (endsAt.getTime() > cutoff) return;
+      if (!includeUnfinished && endsAt.getTime() > cutoff) return;
       const category = String(course.category ?? course.tag ?? '').trim().toUpperCase();
       lessons.push({
-        key: `${course.id}|${formatLocalDate(day)}`, date: formatLocalDate(day), weekday,
-        startsAt: startsAt.getTime(), minutes, startTime: course.startTime, endTime: course.endTime,
+        key: `${course.id}|${formatLocalDate(day)}`, courseId: course.id, date: formatLocalDate(day), weekday,
+        startsAt: startsAt.getTime(), endsAt: endsAt.getTime(), minutes, fee: getCourseTotalValue(course, day), isFixed: Boolean(course.isFixed), startTime: course.startTime, endTime: course.endTime,
         title: course.subject || course.title || course.name || '未命名课程',
         student: course.studentName || course.student || course.name || course.title || '未命名学员',
         studentKey: String(course.studentId || course.studentName || course.student || course.name || course.title || '未命名学员'),
@@ -515,6 +516,8 @@ export default function App() {
   const [statisticsSource, setStatisticsSource] = useState(null);
   const [statisticsNow, setStatisticsNow] = useState(() => new Date());
   const [isStatisticsOpen, setIsStatisticsOpen] = useState(false);
+  const [isReportsOpen, setIsReportsOpen] = useState(false);
+  const closeReports = useCallback(() => setIsReportsOpen(false), []);
   const [statisticsDraft, setStatisticsDraft] = useState(() => getStatisticsRange('month'));
   const [statisticsRange, setStatisticsRange] = useState(() => getStatisticsRange('month'));
   const [statisticsError, setStatisticsError] = useState('');
@@ -1408,6 +1411,7 @@ export default function App() {
     const original = editingCourseId ? courses.find(c => c.id === editingCourseId) : null;
     const targetId = (isDuplicate || !editingCourseId) ? Math.random().toString(36).substr(2, 9) : editingCourseId;
     const data = { ...formData, id: targetId, endTime: minutesToTime(timeToMinutes(formData.startTime) + Number(formData.duration)) };
+    data.name = formData.title.trim();
     data.price = Number(formData.value);
     data.category = formData.tag;
     const learnerLessonSettings = lessonSettingsByTitle.get(formData.title.trim());
@@ -1436,6 +1440,7 @@ export default function App() {
 
     try {
       const priceChanged = original && Number(original.value) !== Number(data.value);
+      const categoryChanged = original && (original.category ?? original.tag) !== data.category;
       const priceEffectiveOccurrence = original ? getOccurrenceKey(viewWeekId, original) : getOccurrenceKey(viewWeekId, data);
       if (isDuplicate || !original || priceChanged) {
         data.priceEffectiveWeek = viewWeekId;
@@ -1445,12 +1450,25 @@ export default function App() {
         && original
         && original.title === data.title.trim()
         && priceChanged;
+      const shouldPreserveCategoryHistory = !isDuplicate && original?.isFixed && categoryChanged;
 
-      if (shouldApplyPriceFromCurrentCourse) {
+      if (shouldApplyPriceFromCurrentCourse || shouldPreserveCategoryHistory) {
         const batch = writeBatch(db);
-        const sameTitleCourses = courses.filter(course => course.title === original.title);
+        // 调价沿用同名课程的未来计价规则；类别只改变当前选中的循环课程。
+        const affectedCourses = shouldApplyPriceFromCurrentCourse
+          ? courses.filter(course => course.title === original.title)
+          : [original];
 
-        sameTitleCourses.forEach(course => {
+        affectedCourses.forEach(course => {
+          const priceUpdates = shouldApplyPriceFromCurrentCourse ? {
+            value: Number(data.value),
+            price: Number(data.value),
+            priceEffectiveWeek: viewWeekId,
+            priceEffectiveOccurrence,
+          } : {};
+          const categoryUpdates = categoryChanged && course.id === original.id
+            ? { category: data.category, tag: data.tag }
+            : {};
           if (!course.isFixed) {
             const occurrenceKey = getOccurrenceKey(course.weekId, course);
             if (occurrenceKey < priceEffectiveOccurrence) return;
@@ -1458,10 +1476,8 @@ export default function App() {
               batch.set(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', course.id), normalizeCourse(data, 0, viewWeekId));
             } else {
               batch.update(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', course.id), {
-                value: Number(data.value),
-                price: Number(data.value),
-                priceEffectiveWeek: viewWeekId,
-                priceEffectiveOccurrence,
+                ...priceUpdates,
+                ...categoryUpdates,
               });
             }
             return;
@@ -1488,19 +1504,21 @@ export default function App() {
           const futureExcludedWeeks = (course.excludedWeeks || []).filter(week => week >= futureStartWeek);
           const pastExcludedWeeks = (course.excludedWeeks || []).filter(week => week < futureStartWeek);
           const sourceForFuture = course.id === original.id ? data : course;
+          const futureUpdates = {
+            ...priceUpdates,
+            ...(shouldApplyPriceFromCurrentCourse ? { priceEffectiveWeek: futureStartWeek } : {}),
+            ...categoryUpdates,
+          };
 
           if (hasHistoricalOccurrences) {
             const futureCourseId = Math.random().toString(36).substr(2, 9);
             const futureCourse = {
               ...sourceForFuture,
               id: futureCourseId,
-              value: Number(data.value),
-              price: Number(data.value),
+              ...futureUpdates,
               baseWeekId: futureStartWeek,
               weekId: null,
               excludedWeeks: futureExcludedWeeks,
-              priceEffectiveWeek: futureStartWeek,
-              priceEffectiveOccurrence,
             };
             if (course.endWeekId) futureCourse.endWeekId = course.endWeekId;
             else delete futureCourse.endWeekId;
@@ -1517,10 +1535,7 @@ export default function App() {
             const updatedCourse = {
               ...sourceForFuture,
               id: course.id,
-              value: Number(data.value),
-              price: Number(data.value),
-              priceEffectiveWeek: futureStartWeek,
-              priceEffectiveOccurrence,
+              ...futureUpdates,
             };
             batch.set(
               doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', course.id),
@@ -1530,7 +1545,7 @@ export default function App() {
         });
 
         await batch.commit();
-        console.info('[schedule:course-save] exact price history update complete', {
+        console.info('[schedule:course-save] exact course history update complete', {
           title: original.title,
           effectiveOccurrence: priceEffectiveOccurrence,
         });
@@ -1847,6 +1862,7 @@ export default function App() {
                   }} className="inline-flex items-center gap-1 px-2 py-1 text-xs bg-teal-50 text-teal-700 border border-teal-200 rounded-lg hover:bg-teal-100">
                     <Clock size={14} />课时统计
                   </button>
+                  <button type="button" onClick={() => { setStatisticsNow(new Date()); setIsReportsOpen(true); }} className="inline-flex items-center gap-1 px-2 py-1 text-xs bg-indigo-50 text-indigo-600 border border-indigo-200 rounded-lg hover:bg-indigo-100"><BarChart3 size={14} />统计报告</button>
                 </div>
               </div>
             </div>
@@ -1922,6 +1938,7 @@ export default function App() {
         </header>
       )}
 
+      {isReportsOpen && <MonthlyReports courses={statisticsCourses} collectLessons={collectCompletedLessons} now={statisticsNow} onClose={closeReports} />}
       {isStatisticsOpen && statisticsResult && (
         <div className="fixed inset-0 z-[10000] bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-3 sm:p-6" onClick={event => { if (event.target === event.currentTarget) setIsStatisticsOpen(false); }}>
           <section role="dialog" aria-modal="true" aria-labelledby="lesson-statistics-title" className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[90dvh] flex flex-col overflow-hidden">
@@ -2374,6 +2391,7 @@ export default function App() {
                     <span className={`px-3 py-1.5 rounded-xl text-[12px] font-black shadow-sm ${TAGS[t].badge}`}>{String(t)} 类别</span>
                   </label>
                 ))}</div>
+                {editingCourseId && <p className="text-[10px] font-bold text-indigo-500">类别调整从当前这堂课起生效，更早的课程保留原类别。</p>}
               </div>
               
               <div className="space-y-3 pt-2 border-t border-slate-100 text-[15px] font-black text-slate-700">重复频率

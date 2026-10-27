@@ -1,7 +1,9 @@
 import { useState, useMemo, useEffect, useRef, useCallback } from 'react';
 import { clampScheduleZoom, getScheduleFitPercent, getScheduleGridPoint, getScheduleStartMinutes } from './scheduleZoom';
 import MonthlyReports from './MonthlyReports.jsx';
-import { Calendar, ChevronLeft, ChevronRight, ChevronDown, Plus, X, Clock, AlertCircle, Download, RefreshCw, Cloud, Copy, FileSpreadsheet, BarChart3, Layers, Settings2, Undo, Database, AlignLeft, Sparkles, Bot, Maximize2, Minimize2, LogOut, Lock, Mail } from 'lucide-react';
+import TimeZoneConverter, { CourseTimeZonePanel, CourseTimeZoneBadge } from './TimeZoneAssistant.jsx';
+import { BEIJING_ZONE, occurrenceDate, convertBeijingLesson, beijingPlacement } from './timeZones.js';
+import { Calendar, ChevronLeft, ChevronRight, ChevronDown, Plus, X, Clock, AlertCircle, Download, RefreshCw, Cloud, Copy, FileSpreadsheet, BarChart3, Globe2, Layers, Settings2, Undo, Database, AlignLeft, Sparkles, Bot, Maximize2, Minimize2, LogOut, Lock, Mail } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut } from 'firebase/auth';
 import { getFirestore, collection, doc, setDoc, deleteDoc, onSnapshot, updateDoc, arrayUnion, writeBatch, getDocs, getDoc } from 'firebase/firestore';
@@ -373,6 +375,13 @@ const normalizeCourse = (rawCourse, index, targetWeekId = currentWeekId) => {
   if (typeof rawCourse.priceEffectiveWeek === 'string') normalized.priceEffectiveWeek = rawCourse.priceEffectiveWeek;
   if (typeof rawCourse.priceEffectiveOccurrence === 'string') normalized.priceEffectiveOccurrence = rawCourse.priceEffectiveOccurrence;
   if (rawCourse.recurrence) normalized.recurrence = String(rawCourse.recurrence);
+  // Optional display metadata: preserve on explicit saves, never migrate old records.
+  if (typeof rawCourse.studentTimeZone === 'string' && rawCourse.studentTimeZone) {
+    try {
+      new Intl.DateTimeFormat('zh-CN', { timeZone: rawCourse.studentTimeZone }).format(0);
+      normalized.studentTimeZone = rawCourse.studentTimeZone;
+    } catch { /* Invalid legacy timezone metadata must not break course loading. */ }
+  }
 
   return normalized;
 };
@@ -518,6 +527,8 @@ export default function App() {
   const [isStatisticsOpen, setIsStatisticsOpen] = useState(false);
   const [isReportsOpen, setIsReportsOpen] = useState(false);
   const closeReports = useCallback(() => setIsReportsOpen(false), []);
+  const [zoneConverter, setZoneConverter] = useState(null);
+  const closeZoneConverter = useCallback(() => setZoneConverter(null), []);
   const [statisticsDraft, setStatisticsDraft] = useState(() => getStatisticsRange('month'));
   const [statisticsRange, setStatisticsRange] = useState(() => getStatisticsRange('month'));
   const [statisticsError, setStatisticsError] = useState('');
@@ -931,6 +942,16 @@ export default function App() {
     () => courses.filter(course => isCourseVisibleInWeek(course, viewWeekId)),
     [courses, viewWeekId],
   );
+  const courseZonePreviews = useMemo(() => {
+    const previews = new Map();
+    visibleCourses.forEach(course => {
+      if (!course.studentTimeZone || course.studentTimeZone === BEIJING_ZONE) return;
+      let duration = timeToMinutes(course.endTime) - timeToMinutes(course.startTime);
+      if (duration <= 0) duration += 1440;
+      previews.set(course.id, convertBeijingLesson(occurrenceDate(viewWeekId, course.colIndex), course.startTime, duration, course.studentTimeZone));
+    });
+    return previews;
+  }, [visibleCourses, viewWeekId]);
 
   const groupedCoursesByCol = useMemo(() => {
     const result = Array(7).fill(null).map(() => []);
@@ -1405,6 +1426,30 @@ export default function App() {
     setIsModalOpen(true);
   }
 
+  const openTimeZoneConverter = (initial = {}) => {
+    const today = beijingPlacement(Date.now());
+    setZoneConverter({ date: today.weekId === viewWeekId ? today.date : viewWeekId, time: '20:00', timeZone: BEIJING_ZONE, duration: 60, context: 'new', ...initial });
+  };
+  const openCourseTimeZone = (course, preview) => {
+    const duration = (timeToMinutes(course.endTime) - timeToMinutes(course.startTime) + 1440) % 1440 || 1440;
+    openTimeZoneConverter({ date: preview.start.date, time: preview.start.time, timeZone: course.studentTimeZone, duration, studentTimeZone: course.studentTimeZone, instant: preview.instant });
+  };
+  const applyConvertedTime = ({ instant, duration, studentTimeZone }) => {
+    const placement = beijingPlacement(instant);
+    if (!placement) return '换算时间无效，请重新选择。';
+    const start = timeToMinutes(placement.startTime);
+    if (start < START_HOUR * 60 || start + duration > END_HOUR * 60) return `换算结果超出当前课表的${START_HOUR}:00—${END_HOUR}:00排课范围，请调整时间后再应用。`;
+    if (zoneConverter.context === 'editor' && editingCourseId && placement.weekId !== viewWeekId) return '换算结果属于其他周。为保留当前课程，请调整日期至正在编辑的这一周，或从顶部换算入口新增课程。';
+    if (zoneConverter.context !== 'editor') openModal(null, placement.colIndex, placement.startTime);
+    if (placement.weekId !== viewWeekId) {
+      const [year, month, day] = placement.weekId.split('-').map(Number);
+      setViewWeekStart(new Date(year, month - 1, day));
+    }
+    setFormData(current => ({ ...current, colIndex: placement.colIndex, startTime: placement.startTime, duration, studentTimeZone }));
+    setZoneConverter(null);
+    return '';
+  };
+
   const handleSave = async (isDuplicate = false) => {
     if (!formData.title.trim() || !user) return;
     saveSnapshotForUndo(); setSyncing(true);
@@ -1863,6 +1908,7 @@ export default function App() {
                     <Clock size={14} />课时统计
                   </button>
                   <button type="button" onClick={() => { setStatisticsNow(new Date()); setIsReportsOpen(true); }} className="inline-flex items-center gap-1 px-2 py-1 text-xs bg-indigo-50 text-indigo-600 border border-indigo-200 rounded-lg hover:bg-indigo-100"><BarChart3 size={14} />统计报告</button>
+                  <button type="button" onClick={() => openTimeZoneConverter()} className="inline-flex items-center gap-1 px-2 py-1 text-xs bg-sky-50 text-sky-700 border border-sky-200 rounded-lg hover:bg-sky-100"><Globe2 size={14} />时区换算</button>
                 </div>
               </div>
             </div>
@@ -1939,6 +1985,7 @@ export default function App() {
       )}
 
       {isReportsOpen && <MonthlyReports courses={statisticsCourses} collectLessons={collectCompletedLessons} now={statisticsNow} onClose={closeReports} />}
+      {zoneConverter && <TimeZoneConverter initial={zoneConverter} onClose={closeZoneConverter} onUse={applyConvertedTime} />}
       {isStatisticsOpen && statisticsResult && (
         <div className="fixed inset-0 z-[10000] bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-3 sm:p-6" onClick={event => { if (event.target === event.currentTarget) setIsStatisticsOpen(false); }}>
           <section role="dialog" aria-modal="true" aria-labelledby="lesson-statistics-title" className="bg-white rounded-2xl shadow-2xl w-full max-w-3xl max-h-[90dvh] flex flex-col overflow-hidden">
@@ -2081,6 +2128,7 @@ export default function App() {
                       const isCompact = heightPx < PIXELS_PER_HOUR;
                       const displayInfo = getCourseDisplayInfo(course, viewWeekId);
                       const finalNotes = [displayInfo.dynamicNote, course.notes].filter(Boolean).join(' | ');
+                      const zonePreview = courseZonePreviews.get(course.id);
 
                       return (
                         <div key={course.id} 
@@ -2097,13 +2145,14 @@ export default function App() {
                             <span className={`min-w-0 whitespace-nowrap font-bold text-slate-500 tracking-tight ${isCompact ? 'text-[7px] leading-[10px]' : 'text-[10px] leading-[14px]'}`}>{course.startTime}—{course.endTime}</span>
                             {(!course.isFixed || course.isBiweekly) && (!isCompact || !hasOverlap) && <span className="ml-auto shrink-0 text-[7px] leading-[10px] text-slate-500 bg-white/80 rounded px-0.5 group-hover/card:opacity-0">{course.isBiweekly ? '隔周' : '临时'}</span>}
                             {isCompact && hasOverlap && <button onClick={e => { e.stopPropagation(); setOverlapState(prev => ({ ...prev, [stateKey]: (activeIdx + 1) % group.length })); }} className="ml-auto shrink-0 flex items-center gap-0.5 rounded bg-white/80 text-[7px] leading-[10px] font-bold"><Layers size={7} />{activeIdx + 1}/{group.length}</button>}
+                            {isCompact && zonePreview && <CourseTimeZoneBadge compact preview={zonePreview} zone={course.studentTimeZone} notes={finalNotes} onClick={() => openCourseTimeZone(course, zonePreview)} />}
                             <button aria-label={`删除课程${course.title}`} onClick={e => { e.stopPropagation(); performDelete(course.id); }} className="absolute top-1 right-1 p-0.5 rounded bg-white opacity-0 group-hover/card:opacity-100 focus:opacity-100 text-slate-400 hover:text-red-500"><X size={isCompact ? 10 : 12} /></button>
                           </div>
                           <div className={`flex items-center gap-1 shrink-0 min-w-0 ${isCompact ? 'mt-auto' : ''}`}>
                             <div className={`schedule-course-title min-w-0 flex-1 truncate font-black pointer-events-none text-slate-900 ${isCompact ? 'text-[10px] leading-[12px]' : 'text-[14px] leading-[18px]'}`}>{String(displayInfo.title)}</div>
                             {isCompact && <span className="schedule-course-price shrink-0 text-[8px] leading-[12px] font-bold text-slate-500">¥{getCourseTotalValue(course, new Date(viewWeekStart.getTime() + colIdx * 86400000))}</span>}
                           </div>
-                          {!isCompact && finalNotes && <div className="schedule-course-notes shrink-0 min-w-0 truncate text-[10px] leading-[12px] font-bold text-slate-500">{finalNotes}</div>}
+                          {!isCompact && (zonePreview ? <CourseTimeZoneBadge preview={zonePreview} zone={course.studentTimeZone} notes={finalNotes} onClick={() => openCourseTimeZone(course, zonePreview)} /> : finalNotes && <div className="schedule-course-notes shrink-0 min-w-0 truncate text-[10px] leading-[12px] font-bold text-slate-500">{finalNotes}</div>)}
                           {!isCompact && <div className="flex items-center justify-between gap-1 mt-auto shrink-0 min-w-0">
                             {hasOverlap ? <button onClick={e => { e.stopPropagation(); setOverlapState(prev => ({ ...prev, [stateKey]: (activeIdx + 1) % group.length })); }} className="flex items-center gap-0.5 px-1 rounded bg-white/80 border border-black/5 text-[8px] leading-[10px] font-bold text-slate-600"><Layers size={8} />{activeIdx + 1}/{group.length}</button> : <span />}
                             {!isCompact && <span className="schedule-course-price text-[10px] leading-[12px] font-black text-slate-500">¥ {getCourseTotalValue(course, new Date(viewWeekStart.getTime() + colIdx * 86400000))}</span>}
@@ -2252,6 +2301,7 @@ export default function App() {
                                   lessonTrackingEnabled: existingCourse.lessonTrackingEnabled || false,
                                   lessonCycleStarts: existingCourse.lessonCycleStarts || [],
                                   lessonTrackingAnchors: existingCourse.lessonTrackingAnchors || [],
+                                  studentTimeZone: existingCourse.studentTimeZone || '',
                                 });
                               } else {
                                 setFormData({...formData, title: name});
@@ -2378,6 +2428,7 @@ export default function App() {
                 </div>
               </div>
 
+              <CourseTimeZonePanel weekId={viewWeekId} formData={formData} onChange={studentTimeZone => setFormData(current => ({ ...current, studentTimeZone }))} onConvert={initial => openTimeZoneConverter({ ...initial, studentTimeZone: formData.studentTimeZone || '', context: 'editor' })} />
               <div className="space-y-3 text-[15px] font-black text-slate-700">标签分类
                 <div className="flex gap-4">{['A', 'B', 'P'].map(t => (
                   <label key={t} className="flex items-center gap-2 cursor-pointer p-2 rounded-xl hover:bg-slate-50 transition-all border border-transparent hover:border-slate-100">

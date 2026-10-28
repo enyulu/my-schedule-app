@@ -1360,7 +1360,7 @@ export default function App() {
       const [year, month, day] = placement.weekId.split('-').map(Number);
       setViewWeekStart(new Date(year, month - 1, day));
     }
-    setFormData(current => ({ ...current, colIndex: placement.colIndex, weekday: placement.colIndex, startTime: placement.startTime, duration, studentTimeZone, studentTimeZoneChanged: current.studentTimeZone !== studentTimeZone }));
+    setFormData(current => ({ ...current, colIndex: placement.colIndex, weekday: placement.colIndex, startTime: placement.startTime, duration, studentTimeZone, studentTimeZoneChanged: true }));
     setZoneConverter(null);
     return '';
   };
@@ -2226,7 +2226,7 @@ export default function App() {
                     onFocus={() => setIsTitleDropdownOpen(true)}
                     onBlur={() => setTimeout(() => setIsTitleDropdownOpen(false), 200)}
                     onChange={e => {
-                      setFormData({ ...formData, title: e.target.value, ...(!editingCourseId ? { studentTimeZone: studentTimeZoneDefault(courses, e.target.value), studentTimeZoneChanged: false } : {}) });
+                      setFormData({ ...formData, title: e.target.value, ...(!editingCourseId ? { studentTimeZone: studentTimeZoneDefault(courses, e.target.value, formData) } : {}) });
                       setIsTitleDropdownOpen(true);
                     }} 
                     className="w-full h-[52px] border-2 border-slate-100 rounded-2xl px-4 text-[15px] leading-none outline-none focus:border-indigo-500 font-bold transition-all bg-white" 
@@ -2253,8 +2253,7 @@ export default function App() {
                                   lessonTrackingEnabled: existingCourse.lessonTrackingEnabled || false,
                                   lessonCycleStarts: existingCourse.lessonCycleStarts || [],
                                   lessonTrackingAnchors: existingCourse.lessonTrackingAnchors || [],
-                                  studentTimeZone: studentTimeZoneDefault(courses, name),
-                                  studentTimeZoneChanged: false,
+                                  studentTimeZone: editingCourseId ? formData.studentTimeZone : studentTimeZoneDefault(courses, name, formData),
                                 });
                               } else {
                                 setFormData({...formData, title: name});
@@ -2353,10 +2352,10 @@ export default function App() {
                 </div>
               </div>
               
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-5 font-bold">
+              <div className="grid grid-cols-1 sm:grid-cols-[220px_minmax(0,1fr)] gap-5 font-bold">
                 <div className="space-y-2"><TimePicker large label="开始时间（北京时间）" value={formData.startTime} onChange={startTime => setFormData(current => ({ ...current, startTime }))} /><p className="text-[10px] text-slate-400 font-bold">结束时间：{minutesToTime(timeToMinutes(formData.startTime) + Number(formData.duration))}{timeToMinutes(formData.startTime) + Number(formData.duration) >= 1440 ? '（次日）' : ''}</p></div>
-                <div className="space-y-2">
-                  <label htmlFor="course-calendar-date" className="block text-[15px] font-black text-slate-700">上课日期 <span className="text-xs font-normal text-indigo-500">{DAYS[formData.colIndex]}</span></label>
+                <div className="space-y-2 min-w-0">
+                  <label htmlFor="course-calendar-date" className="flex items-center gap-1 h-6 text-[15px] font-black text-slate-700">上课日期 <span className="text-xs font-normal text-indigo-500">{DAYS[formData.colIndex]}</span></label>
                   <div className="relative group">
                     <div className="absolute left-3 top-1/2 -translate-y-1/2 w-9 h-9 rounded-xl bg-indigo-50 text-indigo-600 flex items-center justify-center shadow-sm pointer-events-none group-focus-within:bg-indigo-100 transition-all z-10"><Calendar size={18} /></div>
                     <input id="course-calendar-date" type="date" value={occurrenceDate(viewWeekId, Number(formData.colIndex))} min={editingCourseId ? viewWeekId : '1900-01-01'} max={editingCourseId ? occurrenceDate(viewWeekId, 6) : '9998-12-31'} onChange={event => {
@@ -2366,7 +2365,7 @@ export default function App() {
                       setCourseDateError('');
                       if (selected.weekId !== viewWeekId) { const [year, month, day] = selected.weekId.split('-').map(Number); setViewWeekStart(new Date(year, month - 1, day)); }
                       setFormData(current => ({ ...current, colIndex: selected.colIndex, weekday: selected.colIndex }));
-                    }} className="w-full h-12 border-2 border-slate-100 rounded-2xl pl-16 pr-3 text-[14px] font-black outline-none focus:border-indigo-500 bg-slate-50/40" />
+                    }} className="w-full min-w-0 h-12 border-2 border-slate-200 rounded-xl pl-16 pr-3 text-[14px] font-black outline-none focus:border-indigo-400 focus:ring-2 focus:ring-indigo-100 bg-white" />
                   </div>
                   <p className="text-[10px] text-slate-400 font-bold">{editingCourseId ? '修改限定在当前周；更早的固定排课保留历史。' : '选择日期后自动同步课表周与星期。'}</p>
                 </div>

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { hoursToMinutes, collectTuitionOccurrences, calculateTuition, formatTuitionStatement } from '../src/tuitionPackages.js';
+import { hoursToMinutes, collectTuitionOccurrences, calculateTuition, formatTuitionStatement, stepTuitionHours } from '../src/tuitionPackages.js';
 
 const now = Date.parse('2026-10-30T16:00:00Z');
 const startsAt = Date.parse('2026-10-26T00:00:00+08:00');
@@ -16,6 +16,28 @@ test('minute units and actual course duration are not lesson counts', () => {
   for (const value of [0, -1, '', 'x', Infinity]) assert.throws(() => hoursToMinutes(value));
   assert.equal(calc().usedMinutes, 90);
   assert.equal(calc().remainingMinutes, 510);
+});
+
+test('hour controls change by one while allowing fractional manual quantities', () => {
+  assert.equal(stepTuitionHours('', 1), '1');
+  assert.equal(stepTuitionHours('6', 1), '7');
+  assert.equal(stepTuitionHours('6', -1), '5');
+  assert.equal(stepTuitionHours('1.5', 1), '2.5');
+  assert.equal(stepTuitionHours('0.75', -1), '0');
+  assert.equal(hoursToMinutes('0.75'), 45);
+});
+
+test('a six-hour future renewal is recorded as pending rather than disappearing from the balance', () => {
+  const future = { ...pack, minutes: 360, effectiveAt: now + 60000 };
+  const pending = calc({ packages: [future], occurrences: [] });
+  assert.equal(pending.remainingMinutes, 0);
+  assert.equal(pending.recordedMinutes, 360);
+  assert.equal(pending.pendingMinutes, 360);
+  assert.match(formatTuitionStatement(pending, account), /已录入6课时/);
+  assert.match(formatTuitionStatement(pending, account), /待生效6课时/);
+  const active = calculateTuition({ accounts: [account], packages: [future], occurrences: [], bindings: [], adjustments: [], now: now + 60000 }).accounts[0];
+  assert.equal(active.pendingMinutes, 0);
+  assert.equal(active.remainingMinutes, 360);
 });
 test('future, ongoing, cancelled and incomplete courses do not consume credit', () => {
   assert.equal(collect([course], Date.parse('2026-10-28T15:00:00+08:00')).occurrences.length, 0);
@@ -70,6 +92,9 @@ test('adjustments require a reason and voided purchases do not fund lessons', ()
   assert.equal(calc({ adjustments: [{ id: 'gift', accountId: 'math', minutes: 30, reason: '赠送', effectiveAt: startsAt }] }).remainingMinutes, 540);
   assert.equal(calc({ packages: [{ ...pack, voided: true }] }).remainingMinutes, -90);
   assert.ok(calc({ adjustments: [{ id: 'bad', accountId: 'math', minutes: 30, effectiveAt: startsAt }] }).warnings.length);
+  const invalidTime = calc({ adjustments: [{ id: 'invalid-time', accountId: 'math', minutes: 30, reason: '调整' }] });
+  assert.equal(invalidTime.remainingMinutes, 510);
+  assert.ok(invalidTime.warnings.length);
   assert.match(formatTuitionStatement(calc(), account), /剩余.*8.5/);
 });
 

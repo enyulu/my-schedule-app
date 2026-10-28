@@ -1,6 +1,10 @@
 import { BEIJING_ZONE, resolveWallTime, zonedParts } from './timeZones.js';
 
 export const tuitionHours = minutes => String(Math.round(minutes / 60 * 100) / 100);
+export const stepTuitionHours = (value, direction) => {
+  const current = Number(value);
+  return String(Math.round(Math.max(0, (Number.isFinite(current) ? current : 0) + (direction > 0 ? 1 : -1)) * 1000000) / 1000000);
+};
 export const hoursToMinutes = value => {
   const hours = Number(value);
   if (!String(value).trim() || !Number.isFinite(hours) || hours <= 0 || hours > 100000) throw Error('请输入大于0的有效课时');
@@ -170,7 +174,7 @@ export const planBindingMutation = ({ beforeCourses, afterCourses, bindings, acc
 
 export const calculateTuition = ({ accounts = [], packages = [], bindings = [], adjustments = [], occurrences = [], now }) => {
   const warnings = [], results = new Map();
-  for (const account of accounts) results.set(account.id, { ...account, purchasedMinutes: 0, usedMinutes: 0, remainingMinutes: 0, debtMinutes: 0, packages: [], lessons: [], warnings: [], adjustmentMinutes: 0 });
+  for (const account of accounts) results.set(account.id, { ...account, recordedMinutes: 0, pendingMinutes: 0, pendingPackages: [], pendingAdjustmentMinutes: 0, purchasedMinutes: 0, usedMinutes: 0, remainingMinutes: 0, debtMinutes: 0, packages: [], lessons: [], warnings: [], adjustmentMinutes: 0 });
   const bindingMap = new Map(bindings.map(binding => [binding.courseId, binding]));
   const selected = new Map(accounts.map(account => [account.id, []]));
   const seen = new Set();
@@ -189,17 +193,20 @@ export const calculateTuition = ({ accounts = [], packages = [], bindings = [], 
     selected.get(accountId).push({ ...row, creditAt });
   }
   for (const account of results.values()) {
-    const credits = packages.filter(pack => pack.accountId === account.id && !pack.voided && pack.effectiveAt <= Number(now))
+    const credits = packages.filter(pack => pack.accountId === account.id && !pack.voided)
       .sort((a, b) => a.effectiveAt - b.effectiveAt || (a.createdAt || 0) - (b.createdAt || 0) || a.id.localeCompare(b.id));
     for (const pack of credits) {
-      if (!Number.isInteger(pack.minutes) || pack.minutes <= 0) { account.warnings.push('存在无效购买课时'); continue; }
+      if (!Number.isInteger(pack.minutes) || pack.minutes <= 0 || !Number.isFinite(pack.effectiveAt)) { account.warnings.push('存在无效购买课时或生效时间'); continue; }
+      account.recordedMinutes += pack.minutes;
+      if (pack.effectiveAt > Number(now)) { account.pendingMinutes += pack.minutes; account.pendingPackages.push(pack); continue; }
       account.packages.push({ ...pack, usedMinutes: 0, remainingMinutes: pack.minutes });
       account.purchasedMinutes += pack.minutes;
     }
     const events = selected.get(account.id).map(row => ({ ...row, adjustment: false }));
     const funding = [...account.packages];
-    for (const adjustment of adjustments.filter(row => row.accountId === account.id && !row.voided && row.effectiveAt <= Number(now))) {
-      if (!Number.isInteger(adjustment.minutes) || !adjustment.minutes || !adjustment.reason?.trim()) { account.warnings.push('调整记录无效或缺少原因'); continue; }
+    for (const adjustment of adjustments.filter(row => row.accountId === account.id && !row.voided)) {
+      if (!Number.isInteger(adjustment.minutes) || !adjustment.minutes || !Number.isFinite(adjustment.effectiveAt) || !adjustment.reason?.trim()) { account.warnings.push('调整记录无效或缺少原因／生效时间'); continue; }
+      if (adjustment.effectiveAt > Number(now)) { account.pendingAdjustmentMinutes += adjustment.minutes; continue; }
       account.adjustmentMinutes += adjustment.minutes;
       if (adjustment.minutes > 0) funding.push({ ...adjustment, remainingMinutes: adjustment.minutes, usedMinutes: 0, coverDebt: true });
       else events.push({ ...adjustment, startsAt: adjustment.effectiveAt, minutes: -adjustment.minutes, adjustment: true, key: `adjustment|${adjustment.id}` });
@@ -225,4 +232,4 @@ export const calculateTuition = ({ accounts = [], packages = [], bindings = [], 
   return { accounts: [...results.values()], warnings: [...new Set(warnings)] };
 };
 
-export const formatTuitionStatement = (result, account) => `${account.studentName}｜${account.subject}｜${account.category}类\n已录入${tuitionHours(result.purchasedMinutes)}课时｜已用${tuitionHours(result.usedMinutes)}课时｜${result.remainingMinutes < 0 ? '欠' : '剩余'}${tuitionHours(Math.abs(result.remainingMinutes))}课时\n${result.lessons.map(row => `${row.date} ${row.startTime}—${row.endTime}｜${tuitionHours(row.minutes)}课时`).join('\n')}`;
+export const formatTuitionStatement = (result, account) => `${account.studentName}｜${account.subject}｜${account.category}类\n已录入${tuitionHours(result.recordedMinutes ?? result.purchasedMinutes)}课时｜已用${tuitionHours(result.usedMinutes)}课时｜${result.remainingMinutes < 0 ? '欠' : '剩余'}${tuitionHours(Math.abs(result.remainingMinutes))}课时\n${result.pendingMinutes > 0 ? `待生效${tuitionHours(result.pendingMinutes)}课时，尚未计入当前余额\n` : ''}${result.lessons.map(row => `${row.date} ${row.startTime}—${row.endTime}｜${tuitionHours(row.minutes)}课时`).join('\n')}`;

@@ -15,14 +15,14 @@ function ZoneSelect({ value, onChange, label }) {
 
 export function TimePicker({ value, onChange, label = '当地时间', large = false }) {
   const [hour = '', minute = ''] = value.split(':');
-  return <fieldset className="min-w-0"><legend className={`mb-1.5 ${large ? 'text-[15px] font-black text-slate-700' : 'text-xs font-bold text-slate-500'}`}>{label} <span className="font-normal text-xs text-slate-400">24小时制</span></legend>
-    <div className={`${large ? 'h-12' : 'h-11'} flex items-center rounded-xl border border-slate-200 bg-white focus-within:border-indigo-400 focus-within:ring-2 focus-within:ring-indigo-100 px-2`}>
+  return <div role="group" aria-label={`${label} 24小时制`} className="min-w-0"><div className={`flex items-center gap-1.5 ${large ? 'h-6 mb-2 text-[15px] font-black text-slate-700' : 'h-4 mb-1.5 text-xs font-bold text-slate-500'}`}>{label} <span className="font-normal text-xs text-slate-400 whitespace-nowrap">24小时制</span></div>
+    <div className={`${large ? 'h-12 border-2' : 'h-11 border'} w-full max-w-[220px] flex items-center rounded-xl border-slate-200 bg-white focus-within:border-indigo-400 focus-within:ring-2 focus-within:ring-indigo-100 px-2`}>
       <Clock3 size={15} aria-hidden="true" className="shrink-0 text-slate-400 mr-1" />
       <span className="relative flex-1 min-w-0"><select aria-label={`${label}（小时）`} value={hour} onChange={event => onChange(`${event.target.value}:${minute || '00'}`)} className="h-10 w-full appearance-none pl-1 pr-4 bg-transparent text-base font-bold tabular-nums text-slate-800 outline-none"><option value="" disabled>时</option>{Array.from({ length: 24 }, (_, index) => String(index).padStart(2, '0')).map(option => <option key={option}>{option}</option>)}</select><ChevronDown size={11} aria-hidden="true" className="absolute right-0 top-1/2 -translate-y-1/2 pointer-events-none text-slate-400" /></span>
       <span aria-hidden="true" className="px-1 text-slate-300 font-bold">:</span>
       <span className="relative flex-1 min-w-0"><select aria-label={`${label}（分钟）`} value={minute} onChange={event => onChange(`${hour || '00'}:${event.target.value}`)} className="h-10 w-full appearance-none pl-1 pr-4 bg-transparent text-base font-bold tabular-nums text-slate-800 outline-none"><option value="" disabled>分</option>{Array.from({ length: 60 }, (_, index) => String(index).padStart(2, '0')).map(option => <option key={option}>{option}</option>)}</select><ChevronDown size={11} aria-hidden="true" className="absolute right-0 top-1/2 -translate-y-1/2 pointer-events-none text-slate-400" /></span>
     </div>
-  </fieldset>;
+  </div>;
 }
 
 const timeDifference = (target, source) => {

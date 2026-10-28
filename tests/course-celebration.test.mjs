@@ -6,20 +6,21 @@ import assert from 'node:assert/strict';
 // Exercise the actual save handler with only the external Firestore boundary replaced.
 const source = readFileSync(new URL('../src/App.jsx', import.meta.url), 'utf8');
 const saveHandler = source.slice(source.indexOf('  const handleSave = async'), source.indexOf('\n  };', source.indexOf('  const handleSave = async')) + 5);
-const createSave = ({ tag = 'P', recurrence = 'temp', editing = false, fail = false, signedIn = true } = {}) => {
+const createSave = ({ tag = 'P', recurrence = 'temp', editing = false, fail = false, signedIn = true, delay = null } = {}) => {
   const celebrations = [];
   let writes = 0;
-  const formData = { title: 'Test learner', tag, recurrence, startTime: '10:00', duration: 60, value: 400 };
+  const formData = { title: 'Test learner', colIndex: 0, tag, recurrence, startTime: '10:00', duration: 60, value: 400 };
   const context = vm.createContext({
     formData, user: signedIn ? { uid: 'test-only' } : null,
     editingCourseId: editing ? 'existing' : null,
     courses: editing ? [{ ...formData, id: 'existing' }] : [],
     lessonSettingsByTitle: new Map(), viewWeekId: '2026-10-12', FIXED_APP_ID: 'test-only', db: {},
+    canEdit: true, saveInFlightRef: { current: false }, activeUserIdRef: { current: 'test-only' }, setScheduleView() {}, COURSE_TIME_PATTERN: /^([01]\d|2[0-3]):[0-5]\d$/,
     saveSnapshotForUndo() {}, setSyncing() {}, setIsModalOpen() {}, setRestoreError() {},
     setCourseCelebration(effect) { celebrations.push(effect); },
     normalizeCourse: data => data, minutesToTime: () => '11:00', timeToMinutes: () => 600,
     getOccurrenceKey: () => '', getLessonAnchorKey: () => '', doc() {},
-    writeBatch: () => ({ set() {}, update() {}, async commit() { if (fail) throw new Error('offline'); writes++; } }),
+    writeBatch: () => ({ set() {}, update() {}, async commit() { if (delay) await delay; if (fail) throw new Error('offline'); writes++; } }),
     logFirestoreError() {}, setTimeout() {}, console: { info() {} },
   });
   vm.runInContext(saveHandler + '\nglobalThis.save = handleSave;', context);
@@ -50,6 +51,16 @@ test('an explicitly duplicated P course is a new save and celebrates once', asyn
   await run.save(true);
   assert.equal(run.celebrations.length, 1);
   assert.equal(run.celebrations[0].type, 'flower');
+});
+
+test('double tap on save produces one course write while the first write is pending', async () => {
+  let release;
+  const delay = new Promise(resolve => { release = resolve; });
+  const run = createSave({ delay });
+  const first = run.save(), second = run.save();
+  release();
+  await Promise.all([first, second]);
+  assert.equal(run.writes, 1);
 });
 
 test('celebration is removed after one second and its timer is cleaned up', () => {

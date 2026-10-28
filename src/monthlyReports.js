@@ -18,10 +18,14 @@ export const collectReportLessons = ({ courses, month, windowMonths, now, collec
   const [year, number] = month.split('-').map(Number);
   const end = new Date(year, number, 0, 23, 59, 59, 999);
   const endDate = `${month}-${String(end.getDate()).padStart(2, '0')}`;
+  const rows = collectLessons(courses, { start: `${firstMonth}-01`, end: endDate }, end, { includeUnfinished: true });
+  return filterKnownOccurrences(courses, rows, now);
+};
+
+export const filterKnownOccurrences = (courses, rows, now) => {
   const missingStart = new Set(courses.filter(course => course.isFixed && !course.baseWeekId).map(course => course.id));
   const monday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   monday.setDate(monday.getDate() - (monday.getDay() + 6) % 7);
-  const rows = collectLessons(courses, { start: `${firstMonth}-01`, end: endDate }, end, { includeUnfinished: true });
   return { lessons: rows.filter(row => !missingStart.has(row.courseId ?? row.key.split('|')[0]) || row.startsAt >= monday.getTime()), undatedCount: missingStart.size };
 };
 

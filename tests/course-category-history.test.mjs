@@ -16,8 +16,9 @@ async function saveCategory({ courses = [base], id = 'wed', value = 240, categor
     courses: structuredClone(courses), editingCourseId: id, user: { uid: 'local-test-only' },
     formData: { ...original, recurrence: original.isFixed ? (original.isBiweekly ? 'biweekly' : 'weekly') : 'temp', tag: category, value, ...form },
     viewWeekId: '2026-10-19', currentWeekId: '2026-10-19', lessonSettingsByTitle: new Map(), FIXED_APP_ID: 'stable-schedule-private-v999', db: {},
+    canEdit: true, saveInFlightRef: { current: false }, activeUserIdRef: { current: 'local-test-only' }, setScheduleView() {},
     saveSnapshotForUndo() {}, setSyncing() {}, setIsModalOpen() {}, setCourseCelebration() {},
-    setRestoreError: message => errors.push(message), logFirestoreError() {}, setTimeout() {}, console: { info() {}, warn() {} },
+    setRestoreError: message => { if (message) errors.push(message); }, logFirestoreError() {}, setTimeout() {}, console: { info() {}, warn() {} },
     doc: (...parts) => String(parts.at(-1)).split('/').at(-1),
     writeBatch: () => {
       const operations = [];
@@ -113,4 +114,29 @@ test('copy as new leaves the original recurring history intact', async () => {
   assert.equal(saved.at('2026-10-12').length, 1);
   assert.equal(saved.at('2026-10-12')[0].category, 'A');
   assert.deepEqual(saved.at('2026-10-19').map(course => course.category).sort(), ['A', 'P']);
+});
+
+test('changing a fixed lesson date preserves earlier weeks and saves the selected weekday', async () => {
+  const saved = await saveCategory({ category: 'A', form: { colIndex: 4 } });
+  assert.equal(saved.at('2026-10-12', 2).length, 1);
+  assert.equal(saved.at('2026-10-19', 2).length, 0);
+  assert.equal(saved.at('2026-10-19', 4).length, 1);
+  assert.equal(saved.at('2026-10-26', 4).length, 1);
+});
+test('changing a fixed lesson time preserves prior times and fee history', async () => {
+  const saved = await saveCategory({ category: 'A', form: { startTime: '16:00' } });
+  assert.equal(saved.at('2026-10-12', 2, '14:00').length, 1);
+  assert.equal(saved.at('2026-10-19', 2, '14:00').length, 0);
+  assert.equal(saved.at('2026-10-19', 2, '16:00')[0].price, 240);
+});
+
+test('valid early and overnight legacy courses remain editable without losing their times', async () => {
+  for (const [startTime, endTime, duration] of [['07:00', '08:00', 60], ['23:00', '00:30', 90]]) {
+    const course = { ...base, startTime, endTime, duration };
+    const saved = await saveCategory({ category: 'A', courses: [course], form: { notes: 'updated' } });
+    assert.deepEqual(saved.errors, []);
+    assert.equal(saved.records[0].startTime, startTime);
+    assert.equal(saved.records[0].endTime, endTime);
+    assert.equal(saved.records[0].notes, 'updated');
+  }
 });

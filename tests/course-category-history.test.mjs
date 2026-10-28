@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { occurrenceDate } from '../src/timeZones.js';
 
 const source = readFileSync(new URL('../src/App.jsx', import.meta.url), 'utf8');
 const handlerStart = source.indexOf('  const handleSave = async');
@@ -20,9 +21,12 @@ async function saveCategory({ courses = [base], id = 'wed', value = 240, categor
     saveSnapshotForUndo() {}, setSyncing() {}, setIsModalOpen() {}, setCourseCelebration() {},
     setRestoreError: message => { if (message) errors.push(message); }, logFirestoreError() {}, setTimeout() {}, console: { info() {}, warn() {} },
     doc: (...parts) => String(parts.at(-1)).split('/').at(-1),
+    occurrenceDate,
+    courseWriteBatch: () => context.writeBatch(),
     writeBatch: () => {
       const operations = [];
       return {
+        inheritBinding() {}, bindCourse() {}, relocateBinding() {},
         set: (key, data) => operations.push(() => stored.set(key, structuredClone(data))),
         update: (key, data) => operations.push(() => stored.set(key, { ...stored.get(key), ...structuredClone(data) })),
         commit: async () => { if (fail) throw Error('simulated offline'); operations.forEach(run => run()); },

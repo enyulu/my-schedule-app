@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { occurrenceDate } from '../src/timeZones.js';
 const source = readFileSync(new URL('../src/App.jsx', import.meta.url), 'utf8');
 const raw = { id: 'real', name: 'Learner', colIndex: 0, startTime: '10:00', endTime: '11:00', value: 240, category: 'legacy', weekId: '2026-10-26', status: 'cancelled', completed: false, studentId: 'student-1', studentName: 'Nina' };
 function normalizer() {
@@ -52,9 +53,10 @@ test('permanent drag changes future fixed lessons without rewriting historical s
     user: { uid: 'test' }, canEdit: true, syncing: false, saveInFlightRef: { current: false },
     moveConfirmInfo: { course: original, newColIdx: 2, newStartTime: '16:00', newEndTime: '17:00' }, viewWeekId: '2026-10-26', db: {}, FIXED_APP_ID: 'test',
     saveSnapshotForUndo() {}, setSyncing() {}, setMoveConfirmInfo() {}, setRestoreError() {}, logFirestoreError() {},
-    timeToMinutes: time => Number(time.slice(0, 2)) * 60 + Number(time.slice(3)), normalizeCourse: row => row,
+    timeToMinutes: time => Number(time.slice(0, 2)) * 60 + Number(time.slice(3)), normalizeCourse: row => row, occurrenceDate,
     doc: (...parts) => String(parts.at(-1)).split('/').at(-1),
-    writeBatch: () => ({ set: (key, row) => records.set(key, row), update: (key, row) => records.set(key, { ...records.get(key), ...row }), commit: async () => {} }),
+    courseWriteBatch: () => context.writeBatch(),
+    writeBatch: () => ({ inheritBinding() {}, relocateBinding() {}, set: (key, row) => records.set(key, row), update: (key, row) => records.set(key, { ...records.get(key), ...row }), commit: async () => {} }),
   });
   vm.runInContext(handler + '\nglobalThis.move = handleConfirmMove;', context);
   await context.move('permanent');
@@ -68,7 +70,7 @@ test('account change clears undo history, editor and backup drafts', () => {
   const effect = source.slice(start, source.indexOf('\n  }, [authAttempt]);', start) + '\n  }, [authAttempt]);'.length);
   const state = {};
   let observer;
-  const context = { authAttempt: 0, auth: {}, isStandalone: true, activeUserIdRef: { current: null }, saveInFlightRef: { current: false }, console: { error() {} }, useEffect: fn => fn(), onAuthStateChanged: (auth, cb) => { observer = cb; return () => {}; }, getMonday: value => value };
+  const context = { authAttempt: 0, auth: {}, isStandalone: true, activeUserIdRef: { current: null }, saveInFlightRef: { current: false }, pendingUndoRef: { current: null }, console: { error() {} }, useEffect: fn => fn(), onAuthStateChanged: (auth, cb) => { observer = cb; return () => {}; }, getMonday: value => value };
   for (const setter of new Set(effect.match(/set[A-Z]\w+/g))) context[setter] = value => { state[setter] = value; };
   vm.runInContext(effect, vm.createContext(context));
   observer({ uid: 'A' });

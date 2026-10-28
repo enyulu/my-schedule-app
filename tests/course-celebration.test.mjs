@@ -20,7 +20,8 @@ const createSave = ({ tag = 'P', recurrence = 'temp', editing = false, fail = fa
     setCourseCelebration(effect) { celebrations.push(effect); },
     normalizeCourse: data => data, minutesToTime: () => '11:00', timeToMinutes: () => 600,
     getOccurrenceKey: () => '', getLessonAnchorKey: () => '', doc() {},
-    writeBatch: () => ({ set() {}, update() {}, async commit() { if (delay) await delay; if (fail) throw new Error('offline'); writes++; } }),
+    courseWriteBatch: () => context.writeBatch(),
+    writeBatch: () => ({ set() {}, update() {}, inheritBinding() {}, bindCourse() {}, async commit() { if (delay) await delay; if (fail) throw new Error('offline'); writes++; } }),
     logFirestoreError() {}, setTimeout() {}, console: { info() {} },
   });
   vm.runInContext(saveHandler + '\nglobalThis.save = handleSave;', context);

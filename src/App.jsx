@@ -1,6 +1,11 @@
 import { useState, useMemo, useEffect, useRef, useCallback } from 'react';
 import { clampScheduleZoom, getScheduleFitPercent, getScheduleGridPoint, getScheduleStartMinutes } from './scheduleZoom';
 import MonthlyReports from './MonthlyReports.jsx';
+import TuitionPackages from './TuitionPackages.jsx';
+import useTuitionPackages from './useTuitionPackages.js';
+import TuitionBinding from './TuitionBinding.jsx';
+import { createCourseWriteBatch } from './tuitionStore.js';
+import { bindingAccountAt, calculateTuition, collectTuitionOccurrences, tuitionHours, tuitionStartDate } from './tuitionPackages.js';
 import { filterKnownOccurrences } from './monthlyReports.js';
 import TimeZoneConverter, { CourseTimeZonePanel, CourseTimeZoneBadge, TimePicker } from './TimeZoneAssistant.jsx';
 import { courseDateSelection } from './courseDate.js';
@@ -9,7 +14,7 @@ import { BEIJING_ZONE, occurrenceDate, convertBeijingLesson, beijingPlacement } 
 import { Calendar, ChevronLeft, ChevronRight, ChevronDown, Plus, X, Clock, AlertCircle, Download, RefreshCw, Cloud, Copy, FileSpreadsheet, BarChart3, Globe2, Layers, Settings2, Undo, Database, AlignLeft, Sparkles, Bot, Maximize2, Minimize2, LogOut, Lock, Mail } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut } from 'firebase/auth';
-import { getFirestore, collection, doc, setDoc, deleteDoc, onSnapshot, updateDoc, arrayUnion, writeBatch, getDocs, getDoc } from 'firebase/firestore';
+import { getFirestore, collection, doc, setDoc, onSnapshot, writeBatch, getDocs, getDoc } from 'firebase/firestore';
 
 // ============================================================================
 // ⚠️ 独立网站部署必填配置 (如果您要将其部署到自己的服务器/IP上)
@@ -386,7 +391,7 @@ const normalizeCourse = (rawCourse, index, targetWeekId = currentWeekId) => {
       normalized.studentTimeZone = rawCourse.studentTimeZone;
     } catch { delete normalized.studentTimeZone; }
   }
-  ['pendingLessonTrackingEnabled', 'pendingLessonNumber', 'studentTimeZoneChanged'].forEach(key => delete normalized[key]);
+  ['pendingLessonTrackingEnabled', 'pendingLessonNumber', 'studentTimeZoneChanged', 'pendingTuitionAccountId', 'pendingTuitionChanged'].forEach(key => delete normalized[key]);
   Object.keys(normalized).forEach(key => { if (normalized[key] === undefined) delete normalized[key]; });
 
   return normalized;
@@ -445,7 +450,7 @@ const logFirestoreError = (step, error) => {
   }
 };
 
-const replaceFirestoreSchedule = async (userId, rawCourses, source, targetWeekId = currentWeekId, isCurrentUser = () => true) => {
+const replaceFirestoreSchedule = async (userId, rawCourses, source, targetWeekId = currentWeekId, isCurrentUser = () => true, batchFactory = () => writeBatch(db)) => {
   console.info(`[schedule:${source}] write requested`, { userId });
   const validatedCourses = normalizeCourseDataset(rawCourses, source, targetWeekId);
   const coursesRef = getCoursesRef(userId);
@@ -460,7 +465,8 @@ const replaceFirestoreSchedule = async (userId, rawCourses, source, targetWeekId
       documents: currentSnapshot.size,
     });
 
-    const batch = writeBatch(db);
+    const batch = batchFactory();
+    if (batch.markRecovery) batch.markRecovery();
     const previousCourses = currentSnapshot.docs.filter(item => item.id !== '_metadata_').map(item => ({ ...item.data(), id: item.id }));
     batch.set(doc(db, 'artifacts', FIXED_APP_ID, 'users', userId, 'app_state', 'pre_restore_backup'), { courses: previousCourses, timestamp: Date.now(), source: `before-${source}` });
     currentSnapshot.forEach(snapshotDoc => batch.delete(snapshotDoc.ref));
@@ -541,6 +547,8 @@ export default function App() {
   const [statisticsNow, setStatisticsNow] = useState(() => new Date());
   const [isStatisticsOpen, setIsStatisticsOpen] = useState(false);
   const [isReportsOpen, setIsReportsOpen] = useState(false);
+  const [isTuitionOpen, setIsTuitionOpen] = useState(false);
+  const closeTuition = useCallback(() => setIsTuitionOpen(false), []);
   const closeReports = useCallback(() => setIsReportsOpen(false), []);
   const [zoneConverter, setZoneConverter] = useState(null);
   const closeZoneConverter = useCallback(() => setZoneConverter(null), []);
@@ -579,6 +587,7 @@ export default function App() {
   }, [isStatisticsOpen]);
   const [viewWeekStart, setViewWeekStart] = useState(currentRealMonday);
   const [user, setUser] = useState(null);
+  const tuition = useTuitionPackages({ db, appId: FIXED_APP_ID, userId: user?.uid, courses, now: statisticsNow });
   const [authInitialized, setAuthInitialized] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const canEdit = Boolean(user) && !loadError && (dataState === 'ready' || (dataState === 'cached' && courses.length > 0));
@@ -627,9 +636,10 @@ export default function App() {
   const [editingCourseId, setEditingCourseId] = useState(null);
   const [formData, setFormData] = useState({ title: '', colIndex: 0, startTime: '10:00', duration: 60, value: 0, recurrence: 'temp', excludedWeeks: [], tag: 'P', notes: '' });
   const [isLessonSettingsModalOpen, setIsLessonSettingsModalOpen] = useState(false);
+  const [isTuitionBindingOpen, setIsTuitionBindingOpen] = useState(false);
   useEffect(() => { latestDraftRef.current = JSON.stringify(formData); }, [formData]);
   useEffect(() => {
-    if (!isModalOpen || isLessonSettingsModalOpen || zoneConverter) return;
+    if (!isModalOpen || isLessonSettingsModalOpen || zoneConverter || isTuitionOpen) return;
     const previousFocus = document.activeElement;
     courseDialogRef.current?.querySelector('input')?.focus();
     const key = event => {
@@ -643,7 +653,7 @@ export default function App() {
     };
     window.addEventListener('keydown', key);
     return () => { window.removeEventListener('keydown', key); if (previousFocus?.isConnected) previousFocus.focus(); };
-  }, [isModalOpen, isLessonSettingsModalOpen, zoneConverter, closeCourseDialog]);
+  }, [isModalOpen, isLessonSettingsModalOpen, zoneConverter, isTuitionOpen, closeCourseDialog]);
   const [lessonSettingsDraft, setLessonSettingsDraft] = useState({ enabled: false, lessonNumber: 1 });
   const [lessonSettingsStatus, setLessonSettingsStatus] = useState('');
   const [isNameManagerOpen, setIsNameManagerOpen] = useState(false);
@@ -666,6 +676,7 @@ export default function App() {
   const [backupText, setBackupText] = useState("");
   const [backupStatus, setBackupStatus] = useState("");
   const [undoStack, setUndoStack] = useState([]);
+  const pendingUndoRef = useRef(null);
   const [isSavingTemplate, setIsSavingTemplate] = useState(false);
 
   const [isAIModalOpen, setIsAIModalOpen] = useState(false);
@@ -754,6 +765,8 @@ export default function App() {
             setIsBackupModalOpen(false); setIsLessonSettingsModalOpen(false);
             setIsNameManagerOpen(false); setIsTitleDropdownOpen(false);
             setIsStatisticsOpen(false); setIsReportsOpen(false); setIsExportModalOpen(false);
+            setIsTuitionOpen(false);
+            setIsTuitionBindingOpen(false); pendingUndoRef.current = null;
             setIsAIModalOpen(false); setScheduleAnalysisResult('');
             setZoneConverter(null); setMoveConfirmInfo(null); setDragInfo(null);
             setCourseCelebration(null); setRestoreError(''); setOverlapState({});
@@ -1047,15 +1060,45 @@ export default function App() {
     return res;
   }, [isExportModalOpen, exportRange, exportCourseFilter, courses, getCourseDisplayInfo]);
 
-  const saveSnapshotForUndo = () => setUndoStack(prev => [...prev, JSON.parse(JSON.stringify(coursesRefLatest.current))]);
+  const saveSnapshotForUndo = useCallback(() => { pendingUndoRef.current = { courses: JSON.parse(JSON.stringify(coursesRefLatest.current)), bindings: JSON.parse(JSON.stringify(tuition.state.bindings)) }; }, [tuition.state.bindings]);
+
+  const courseWriteBatch = useCallback(() => {
+    const undo = pendingUndoRef.current; pendingUndoRef.current = null;
+    return createCourseWriteBatch({ db, appId: FIXED_APP_ID, userId: user.uid, isCurrentUser: () => activeUserIdRef.current === user.uid, beforeCourses: courses, tuitionState: tuition.state, normalizeCourse,
+      confirmImpact: plan => {
+        const nextBindings = [...tuition.state.bindings.filter(row => !plan.bindingChanges.some(change => change.id === row.id)), ...plan.bindingChanges.map(change => change.data)];
+        const collected = collectTuitionOccurrences({ courses: plan.afterCourses, fromDate: tuitionStartDate(tuition.state.accounts, nextBindings, Date.now()), now: Date.now() });
+        const next = calculateTuition({ ...tuition.state, bindings: nextBindings, occurrences: collected.occurrences, now: Date.now() });
+        const lines = plan.affectedAccountIds.map(id => {
+          const previous = tuition.results.accounts.find(row => row.id === id), result = next.accounts.find(row => row.id === id);
+          return `${result?.studentName || '学员'} · ${result?.subject || '课包'}：${tuitionHours(previous?.remainingMinutes || 0)} → ${tuitionHours(result?.remainingMinutes || 0)}课时`;
+        });
+        return window.confirm(`此操作会重新核算相关课包，并保留操作记录：\n${lines.join('\n')}\n确认继续？`);
+      },
+      onApplied: plan => { if (undo) setUndoStack(previous => [...previous, { ...undo, afterBindingVersions: Object.fromEntries(plan.bindingChanges.map(change => [change.id, change.expectedVersion + 1])) }]); },
+    });
+  }, [courses, tuition.state, tuition.results, user]);
+
+  const getDraftTuitionAccount = () => {
+    if (formData.pendingTuitionChanged) return formData.pendingTuitionAccountId || '';
+    if (!editingCourseId) return '';
+    const original = courses.find(row => row.id === editingCourseId);
+    if (!original) return '';
+    return bindingAccountAt(tuition.state.bindings.find(row => row.courseId === editingCourseId), `${occurrenceDate(viewWeekId, Number(original.colIndex))}|${original.startTime}`) || '';
+  };
 
   const handleUndo = async () => {
     if (!canEdit || syncing || saveInFlightRef.current) return;
     if (undoStack.length === 0 || !user) return;
     saveInFlightRef.current = true; setRestoreError(''); setSyncing(true);
     try {
-      const previousCourses = undoStack[undoStack.length - 1];
-      const batch = writeBatch(db);
+      const entry = undoStack[undoStack.length - 1];
+      const previousCourses = entry.courses;
+      for (const [id, version] of Object.entries(entry.afterBindingVersions || {})) {
+        if (tuition.state.bindings.find(row => row.id === id)?.version !== version) throw Error('课包关联已有后续修改，不能覆盖撤销，请先核对记录');
+      }
+      const batch = courseWriteBatch();
+      batch.restoreBindings(Object.keys(entry.afterBindingVersions || {}).map(id => entry.bindings.find(row => row.id === id) || { id, courseId: id, segments: [], sourceDeleted: true }));
       courses.forEach(c => { if (!previousCourses.find(pc => pc.id === c.id)) batch.delete(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', c.id)); });
       previousCourses.forEach(c => batch.set(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', c.id), c));
       await batch.commit();
@@ -1066,6 +1109,7 @@ export default function App() {
   const openModal = useCallback((course = null, colIdx = 0, defaultStartTime = '10:00') => {
     if (!canEdit || saveInFlightRef.current) { setRestoreError('请先等待课表读取或当前操作完成。'); return; }
     setCourseDateError('');
+    setIsTuitionBindingOpen(false);
     setIsNameManagerOpen(false); setIsTitleDropdownOpen(false); setDeleteConfirmTitle(null);
     let draft;
     if (course) {
@@ -1078,7 +1122,7 @@ export default function App() {
     latestDraftRef.current = initialDraftRef.current;
     setFormData(draft);
     setIsModalOpen(true);
-  }, [canEdit, setRestoreError, setCourseDateError, setIsNameManagerOpen, setIsTitleDropdownOpen, setDeleteConfirmTitle, setEditingCourseId, setFormData, setIsModalOpen]);
+  }, [canEdit, setRestoreError, setCourseDateError, setIsTuitionBindingOpen, setIsNameManagerOpen, setIsTitleDropdownOpen, setDeleteConfirmTitle, setEditingCourseId, setFormData, setIsModalOpen]);
 
   const handleCourseMouseDown = (e, course) => {
     if (!canEdit || syncing || saveInFlightRef.current || (touchStartRef.current && e.timeStamp - touchStartRef.current.at < 600)) return;
@@ -1123,13 +1167,16 @@ export default function App() {
             }
             saveInFlightRef.current = true; setRestoreError(''); saveSnapshotForUndo(); setSyncing(true);
             try {
-              await updateDoc(doc(db, `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${course.id}`), {
+              const batch = courseWriteBatch();
+              batch.update(doc(db, `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${course.id}`), {
                 colIndex: colIdx,
                 weekday: colIdx,
                 startTime: newStartTime,
                 endTime: newEndTime,
                 duration: actualDur,
               });
+              batch.relocateBinding(course.id, course.id, `${occurrenceDate(course.weekId, Number(course.colIndex))}|${course.startTime}`, `${occurrenceDate(viewWeekId, colIdx)}|${newStartTime}`, false);
+              await batch.commit();
             } catch (error) {
               logFirestoreError('course:move', error);
               setRestoreError(`移动未完成：${error.message}`);
@@ -1144,7 +1191,9 @@ export default function App() {
                const newData = { ...course, id: newId, colIndex: colIdx, weekday: colIdx, startTime: newStartTime, endTime: newEndTime };
                if (!newData.isFixed) { newData.weekId = viewWeekId; delete newData.baseWeekId; } else { newData.weekId = null; newData.baseWeekId = viewWeekId; }
                const validatedCopy = normalizeCourse(newData, 0, viewWeekId);
-               await setDoc(doc(db, `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${newId}`), validatedCopy);
+               const batch = courseWriteBatch();
+               batch.set(doc(db, `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${newId}`), validatedCopy);
+               await batch.commit();
             } catch (error) {
               logFirestoreError('course:copy', error);
                setRestoreError(`复制未完成：${error.message}`);
@@ -1160,7 +1209,7 @@ export default function App() {
     window.addEventListener('mousemove', handleMouseMove);
     window.addEventListener('mouseup', handleMouseUp);
     return () => { window.removeEventListener('mousemove', handleMouseMove); window.removeEventListener('mouseup', handleMouseUp); };
-  }, [dragInfo, viewWeekId, user, openModal, canEdit, syncing]);
+  }, [dragInfo, viewWeekId, user, openModal, canEdit, syncing, courseWriteBatch, saveSnapshotForUndo]);
 
   const handleConfirmMove = async (type) => {
     if (!moveConfirmInfo || !user || !canEdit || syncing || saveInFlightRef.current) return;
@@ -1168,10 +1217,10 @@ export default function App() {
     saveSnapshotForUndo(); setSyncing(true);
     const { course, newColIdx, newStartTime, newEndTime } = moveConfirmInfo;
     try {
-      const batch = writeBatch(db);
+      const batch = courseWriteBatch();
       if (type === 'temp') {
         const originalPath = `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${course.id}`;
-        batch.update(doc(db, originalPath), { excludedWeeks: arrayUnion(viewWeekId) });
+        batch.update(doc(db, originalPath), { excludedWeeks: [...new Set([...(course.excludedWeeks || []), viewWeekId])] });
         const newId = Math.random().toString(36).substr(2, 9);
         const tempCourse = { ...course, id: newId, colIndex: newColIdx, weekday: newColIdx, startTime: newStartTime, endTime: newEndTime, isFixed: false, isBiweekly: false, weekId: viewWeekId, recurrence: 'temp' };
         delete tempCourse.baseWeekId; delete tempCourse.excludedWeeks;
@@ -1179,6 +1228,7 @@ export default function App() {
           doc(db, `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${newId}`),
           normalizeCourse(tempCourse, 0, viewWeekId),
         );
+        batch.relocateBinding(course.id, newId, `${occurrenceDate(viewWeekId, Number(course.colIndex))}|${course.startTime}`, `${occurrenceDate(viewWeekId, newColIdx)}|${newStartTime}`, false);
       } else if (type === 'permanent') {
         let duration = timeToMinutes(newEndTime) - timeToMinutes(newStartTime);
         if (duration <= 0) duration += 1440;
@@ -1186,6 +1236,7 @@ export default function App() {
         const futureId = past ? Math.random().toString(36).slice(2, 11) : course.id;
         if (past) batch.update(doc(db, `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${course.id}`), { endWeekId: viewWeekId, excludedWeeks: (course.excludedWeeks || []).filter(week => week < viewWeekId) });
         batch.set(doc(db, `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${futureId}`), normalizeCourse({ ...course, id: futureId, colIndex: newColIdx, weekday: newColIdx, startTime: newStartTime, endTime: newEndTime, duration, baseWeekId: viewWeekId, excludedWeeks: (course.excludedWeeks || []).filter(week => week >= viewWeekId) }, 0, viewWeekId));
+        batch.relocateBinding(course.id, futureId, `${occurrenceDate(viewWeekId, Number(course.colIndex))}|${course.startTime}`, `${occurrenceDate(viewWeekId, newColIdx)}|${newStartTime}`, true);
       }
       await batch.commit();
     } catch (error) {
@@ -1244,7 +1295,7 @@ export default function App() {
       if (!window.confirm(`确认用备份的${validatedCourses.length}条课程替换当前课表？当前云端记录会先原子保存为恢复前副本。`)) return;
       saveSnapshotForUndo();
       if (activeUserIdRef.current !== user.uid) return;
-      const restored = await replaceFirestoreSchedule(user.uid, validatedCourses, 'latest-backup', viewWeekId, () => activeUserIdRef.current === user.uid);
+      const restored = await replaceFirestoreSchedule(user.uid, validatedCourses, 'latest-backup', viewWeekId, () => activeUserIdRef.current === user.uid, courseWriteBatch);
       if (activeUserIdRef.current !== user.uid) return;
       setCourses(restored); setHideEmptyOverlay(true);
     } catch (error) {
@@ -1260,7 +1311,7 @@ export default function App() {
     try {
       const localSeed = createDefaultSchedule(viewWeekId);
       saveSnapshotForUndo();
-      const initialized = await replaceFirestoreSchedule(user.uid, localSeed, 'manual-local-seed', viewWeekId, () => activeUserIdRef.current === user.uid);
+      const initialized = await replaceFirestoreSchedule(user.uid, localSeed, 'manual-local-seed', viewWeekId, () => activeUserIdRef.current === user.uid, courseWriteBatch);
       if (activeUserIdRef.current !== user.uid) return;
       setCourses(initialized); setHideEmptyOverlay(true);
     } catch (error) {
@@ -1293,6 +1344,7 @@ export default function App() {
         'manual-import',
         viewWeekId,
         () => activeUserIdRef.current === user.uid,
+        courseWriteBatch,
       );
       if (activeUserIdRef.current !== user.uid) return;
       setCourses(restoredCourses);
@@ -1406,6 +1458,12 @@ export default function App() {
     data.weekId = data.isFixed ? null : (isDuplicate ? viewWeekId : (original && !original.isFixed ? original.weekId : viewWeekId));
     if (isDuplicate) data.excludedWeeks = [];
 
+    const applyTuitionSelection = (batch, id, week = viewWeekId, course = data) => {
+      if (!formData.pendingTuitionChanged) return;
+      if (isDuplicate && formData.pendingTuitionAccountId && !window.confirm('复制的是一堂新课程，确认也关联当前选定课包？')) throw Error('已取消复制，未修改课程或课包');
+      batch.bindCourse(id, `${occurrenceDate(week, Number(course.colIndex))}|${course.startTime}`, formData.pendingTuitionAccountId || null);
+    };
+
     try {
       const priceChanged = original && Number(original.value) !== Number(data.value);
       const categoryChanged = original && (original.category ?? original.tag) !== data.category;
@@ -1426,7 +1484,7 @@ export default function App() {
       );
 
       if (shouldApplyPriceFromCurrentCourse || shouldPreserveCategoryHistory || shouldPreserveScheduleHistory) {
-        const batch = writeBatch(db);
+        const batch = courseWriteBatch();
         // 调价沿用同名课程的未来计价规则；类别只改变当前选中的循环课程。
         const affectedCourses = shouldApplyPriceFromCurrentCourse
           ? courses.filter(course => course.title === original.title)
@@ -1447,6 +1505,7 @@ export default function App() {
             if (occurrenceKey < priceEffectiveOccurrence) return;
             if (course.id === original.id) {
               batch.set(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', course.id), normalizeCourse(data, 0, viewWeekId));
+              applyTuitionSelection(batch, course.id);
             } else {
               batch.update(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', course.id), {
                 ...priceUpdates,
@@ -1504,6 +1563,10 @@ export default function App() {
               doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', futureCourseId),
               normalizeCourse(futureCourse, 0, futureStartWeek),
             );
+            if (course.id === original.id && (original.startTime !== data.startTime || Number(original.colIndex) !== Number(data.colIndex))) {
+              batch.relocateBinding(course.id, futureCourseId, `${occurrenceDate(viewWeekId, Number(original.colIndex))}|${original.startTime}`, `${occurrenceDate(futureStartWeek, Number(data.colIndex))}|${data.startTime}`, Boolean(data.isFixed));
+            } else batch.inheritBinding(course.id, futureCourseId, `${futureStartWeek}|00:00`);
+            if (course.id === original.id) applyTuitionSelection(batch, futureCourseId, futureStartWeek);
           } else {
             const updatedCourse = {
               ...sourceForFuture,
@@ -1514,6 +1577,8 @@ export default function App() {
               doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', course.id),
               normalizeCourse(updatedCourse, 0, futureStartWeek),
             );
+            if (course.id === original.id && (original.startTime !== data.startTime || Number(original.colIndex) !== Number(data.colIndex))) batch.relocateBinding(course.id, course.id, `${occurrenceDate(viewWeekId, Number(original.colIndex))}|${original.startTime}`, `${occurrenceDate(futureStartWeek, Number(data.colIndex))}|${data.startTime}`, Boolean(data.isFixed));
+            if (course.id === original.id) applyTuitionSelection(batch, course.id, futureStartWeek);
           }
         });
 
@@ -1533,8 +1598,10 @@ export default function App() {
         id: targetId,
         name: validatedCourse.name,
       });
-      const batch = writeBatch(db);
+      const batch = courseWriteBatch();
       batch.set(doc(db, `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${targetId}`), validatedCourse);
+      if (!isDuplicate && original && !original.isFixed && (original.startTime !== data.startTime || Number(original.colIndex) !== Number(data.colIndex))) batch.relocateBinding(original.id, targetId, `${occurrenceDate(original.weekId, Number(original.colIndex))}|${original.startTime}`, `${occurrenceDate(data.weekId, Number(data.colIndex))}|${data.startTime}`, false);
+      applyTuitionSelection(batch, targetId);
       if (typeof formData.pendingLessonTrackingEnabled === 'boolean') {
         courses.filter(course => course.title === data.title && course.id !== targetId).forEach(course => {
           batch.update(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', course.id), {
@@ -1567,20 +1634,22 @@ export default function App() {
     const path = `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${id}`;
     
     try {
+      const batch = courseWriteBatch();
       if (c.isFixed) {
         if (!force) {
-          await updateDoc(doc(db, path), { excludedWeeks: arrayUnion(viewWeekId) });
+          batch.update(doc(db, path), { excludedWeeks: [...new Set([...(c.excludedWeeks || []), viewWeekId])] });
         } else {
           // 如果在这门课创建的那一周删除，则抹除数据；否则，设置结束日期以保留财务与排课历史。
           if (c.baseWeekId === viewWeekId) {
-            await deleteDoc(doc(db, path));
+            batch.delete(doc(db, path));
           } else {
-            await updateDoc(doc(db, path), { endWeekId: viewWeekId });
+            batch.update(doc(db, path), { endWeekId: viewWeekId });
           }
         }
       } else {
-        await deleteDoc(doc(db, path));
+        batch.delete(doc(db, path));
       }
+      await batch.commit();
       setIsModalOpen(false);
     } catch (e) {
       console.error(e);
@@ -1592,32 +1661,39 @@ export default function App() {
     }
   };
 
-  const handleBatchDeleteName = async (name) => {
+  const handleBatchDeleteName = async (event) => {
+    const name = event.currentTarget.dataset.courseName;
+    if (!user || !canEdit || syncing || saveInFlightRef.current) return;
     if (deleteConfirmTitle !== name) { setDeleteConfirmTitle(name); return; }
-    saveSnapshotForUndo(); setSyncing(true);
+    saveInFlightRef.current = true; saveSnapshotForUndo(); setSyncing(true);
     try {
-      const batch = writeBatch(db);
-      const snap = await getDocs(collection(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses'));
-      snap.forEach(d => { if (d.data().title === name) batch.delete(d.ref); });
+      const batch = courseWriteBatch();
+      courses.filter(course => course.title === name).forEach(course => batch.delete(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', course.id)));
       await batch.commit(); setDeleteConfirmTitle(null);
-    } catch (e) { console.error(e); } finally { setSyncing(false); }
+    } catch (e) { setRestoreError(`批量删除未完成：${e.message}`); } finally { saveInFlightRef.current = false; setSyncing(false); }
   };
 
-  const handleBatchEditName = async (oldName, newName) => {
+  const handleBatchEditName = async (event) => {
+    if (event.type === 'keydown') {
+      if (event.key === 'Escape') { setEditingNameState({ oldName: null, newName: '' }); return; }
+      if (event.key !== 'Enter') return;
+      event.preventDefault();
+    }
+    const oldName = event.currentTarget.dataset.courseName, newName = editingNameState.newName;
+    if (!user || !canEdit || syncing || saveInFlightRef.current) return;
     const finalNewName = newName.trim(); if (!finalNewName || oldName === finalNewName) { setEditingNameState({ oldName: null, newName: '' }); return; }
-    saveSnapshotForUndo(); setSyncing(true);
+    saveInFlightRef.current = true; saveSnapshotForUndo(); setSyncing(true);
     try {
-      const batch = writeBatch(db);
-      const snap = await getDocs(collection(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses'));
-      snap.forEach(d => {
-        if (d.data().title === oldName) batch.update(d.ref, {
+      const batch = courseWriteBatch();
+      courses.filter(course => course.title === oldName).forEach(course => {
+        batch.update(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', course.id), {
           title: finalNewName,
           name: finalNewName,
         });
       });
       await batch.commit(); setEditingNameState({ oldName: null, newName: '' });
       if (formData.title === oldName) setFormData({ ...formData, title: finalNewName });
-    } catch (e) { console.error(e); } finally { setSyncing(false); }
+    } catch (e) { setRestoreError(`批量改名未完成：${e.message}`); } finally { saveInFlightRef.current = false; setSyncing(false); }
   };
 
   const openLessonSettingsDialog = () => {
@@ -1640,6 +1716,7 @@ export default function App() {
   };
 
   const saveLessonSettingsFromCurrentCourse = async (lessonNumberOverride = null) => {
+    if (!canEdit || syncing || saveInFlightRef.current) return;
     const title = formData.title.trim();
     if (!title) return;
     const lessonNumber = Math.max(1, Math.round(Number(lessonNumberOverride ?? lessonSettingsDraft.lessonNumber) || 1));
@@ -1658,6 +1735,7 @@ export default function App() {
     }
 
     if (!user) return;
+    saveInFlightRef.current = true;
     const matchingCourses = courses.filter(course => course.title === title);
     const anchorMap = new Map(lessonSettingsByTitle.get(title)?.anchors || []);
     const currentAnchor = {
@@ -1674,7 +1752,7 @@ export default function App() {
     saveSnapshotForUndo();
     setSyncing(true);
     try {
-      const batch = writeBatch(db);
+      const batch = courseWriteBatch();
       matchingCourses.forEach(course => {
         batch.update(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', course.id), {
           lessonTrackingEnabled: enabled,
@@ -1688,6 +1766,7 @@ export default function App() {
       logFirestoreError('lesson-tracking:save', error);
       setLessonSettingsStatus('保存失败，请重试');
     } finally {
+      saveInFlightRef.current = false;
       setSyncing(false);
     }
   };
@@ -1847,6 +1926,7 @@ export default function App() {
                     <Clock size={14} />课时统计
                   </button>
                   <button type="button" onClick={() => { setStatisticsNow(new Date()); setIsReportsOpen(true); }} className="inline-flex items-center gap-1 px-2 py-1 text-xs bg-indigo-50 text-indigo-600 border border-indigo-200 rounded-lg hover:bg-indigo-100"><BarChart3 size={14} />统计报告</button>
+                  <button type="button" onClick={() => { setStatisticsNow(new Date()); setIsTuitionOpen(true); }} className="inline-flex items-center gap-1 px-2 py-1 text-xs bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-lg hover:bg-emerald-100"><Layers size={14} />课包管理</button>
                   <button type="button" onClick={() => openTimeZoneConverter()} className="inline-flex items-center gap-1 px-2 py-1 text-xs bg-sky-50 text-sky-700 border border-sky-200 rounded-lg hover:bg-sky-100"><Globe2 size={14} />时区换算</button>
                 </div>
                 {completedSummary.undatedCount > 0 && <p className="text-[10px] text-amber-700 mt-1">部分旧固定课缺少起始日期，历史统计采用保守口径；详见统计报告。</p>}
@@ -1927,6 +2007,7 @@ export default function App() {
       {(loadError || restoreError || dataState === 'cached') && <div role="alert" className={`shrink-0 px-4 py-3 text-xs flex flex-wrap items-center gap-2 ${loadError || restoreError ? 'bg-red-50 text-red-700' : 'bg-amber-50 text-amber-800'}`}><span className="flex-1">{loadError || restoreError || '当前为离线缓存。编辑保存需等待网络恢复；未收到服务器确认前不会显示已同步。'}</span>{loadError && <button disabled={syncing} onClick={() => { setDataState('loading'); setLoadError(''); setLoadAttempt(value => value + 1); }} className="underline font-bold">重试读取</button>}{restoreError && <button onClick={() => setRestoreError('')} className="font-bold underline">知道了</button>}</div>}
 
       {isReportsOpen && <MonthlyReports courses={statisticsCourses} collectLessons={collectCompletedLessons} now={statisticsNow} onClose={closeReports} />}
+      {isTuitionOpen && <TuitionPackages key={user?.uid || 'signed-out'} state={tuition.state} results={tuition.results} pending={tuition.pending} onCommand={tuition.commit} courses={courses} now={statisticsNow} viewWeekId={viewWeekId} onClose={closeTuition} />}
       {zoneConverter && <TimeZoneConverter initial={zoneConverter} onClose={closeZoneConverter} onUse={applyConvertedTime} />}
       {isStatisticsOpen && statisticsResult && (
         <div className="fixed inset-0 z-[10000] bg-slate-900/50 backdrop-blur-sm flex items-center justify-center p-3 sm:p-6" onClick={event => { if (event.target === event.currentTarget) setIsStatisticsOpen(false); }}>
@@ -2201,7 +2282,7 @@ export default function App() {
       )}
 
       {isModalOpen && (
-        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center z-[50] p-4 animate-in fade-in">
+        <div aria-hidden={isTuitionOpen || undefined} className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center z-[50] p-4 animate-in fade-in">
           <div ref={courseDialogRef} role="dialog" aria-modal="true" aria-labelledby="course-dialog-title" className="bg-white rounded-[24px] sm:rounded-[32px] shadow-2xl w-full max-w-2xl border border-slate-100 font-sans flex flex-col max-h-[92dvh]">
             <div className="flex items-center justify-between px-8 py-5 border-b border-slate-100 bg-slate-50/50 shrink-0">
               <h2 id="course-dialog-title" className="text-xl sm:text-2xl font-black text-slate-800 font-sans tracking-tight">{editingCourseId ? '修改课程' : '添加课程'}</h2>
@@ -2286,13 +2367,11 @@ export default function App() {
                                     value={editingNameState.newName}
                                     onChange={(e) => setEditingNameState({...editingNameState, newName: e.target.value})}
                                     className="flex-1 border-2 border-indigo-200 rounded-xl px-3 py-2 text-[15px] font-bold outline-none focus:border-indigo-500"
-                                    onKeyDown={(e) => {
-                                      if (e.key === 'Enter') handleBatchEditName(name, editingNameState.newName);
-                                      if (e.key === 'Escape') setEditingNameState({oldName: null, newName: ''});
-                                    }}
+                                    data-course-name={name}
+                                    onKeyDown={handleBatchEditName}
                                   />
                                   <div className="flex gap-1 shrink-0">
-                                    <button onClick={() => handleBatchEditName(name, editingNameState.newName)} className="px-3 py-2 rounded-xl text-[12px] font-black bg-emerald-500 text-white hover:bg-emerald-600 transition-all shadow-sm">保存</button>
+                                    <button data-course-name={name} onClick={handleBatchEditName} className="px-3 py-2 rounded-xl text-[12px] font-black bg-emerald-500 text-white hover:bg-emerald-600 transition-all shadow-sm">保存</button>
                                     <button onClick={() => setEditingNameState({oldName: null, newName: ''})} className="px-3 py-2 rounded-xl text-[12px] font-black bg-slate-100 text-slate-500 hover:bg-slate-200 transition-all">取消</button>
                                   </div>
                                 </div>
@@ -2301,7 +2380,7 @@ export default function App() {
                                   <span className="font-bold text-slate-700 text-[15px] truncate pr-2 flex-1 min-w-[100px]">{String(name)}</span>
                                   <div className="flex gap-1.5 shrink-0 opacity-100 transition-opacity items-center">
                                     <button onClick={() => setEditingNameState({oldName: name, newName: name})} className="px-3 py-1.5 rounded-xl text-[12px] font-black bg-slate-100 text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 transition-all">改名</button>
-                                    <button onClick={() => handleBatchDeleteName(name)} className={`px-3 py-1.5 rounded-xl text-[12px] font-black transition-all ${deleteConfirmTitle===name ? 'bg-red-500 text-white animate-pulse shadow-sm':'bg-slate-100 text-slate-400 hover:text-red-500 hover:bg-red-50'}`}>{deleteConfirmTitle===name ? '确认移除?' : '移除'}</button>
+                                    <button data-course-name={name} onClick={handleBatchDeleteName} className={`px-3 py-1.5 rounded-xl text-[12px] font-black transition-all ${deleteConfirmTitle===name ? 'bg-red-500 text-white animate-pulse shadow-sm':'bg-slate-100 text-slate-400 hover:text-red-500 hover:bg-red-50'}`}>{deleteConfirmTitle===name ? '确认移除?' : '移除'}</button>
                                   </div>
                                 </>
                               )}
@@ -2398,12 +2477,12 @@ export default function App() {
               </div>
 
               <div className="space-y-2 pt-2 border-t border-slate-100 text-[15px] font-bold text-slate-700">
-                <div className="flex items-center justify-between">
+                <div className="flex flex-wrap gap-2 items-center justify-between">
                   <div className="flex items-center gap-1.5">
                     <AlignLeft size={14}/>
                     <span>备注说明</span>
                   </div>
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     <button
                       onClick={openLessonSettingsDialog}
                       disabled={!formData.title.trim()}
@@ -2412,6 +2491,7 @@ export default function App() {
                       <Settings2 size={12}/>
                       课时设置
                     </button>
+                    <button type="button" onClick={() => setIsTuitionBindingOpen(value => !value)} className="text-[11px] flex items-center gap-1 px-2.5 py-1 rounded-lg border border-emerald-200 bg-emerald-50 text-emerald-700"><Layers size={12}/>关联课包</button>
                     <button
                       onClick={handleAIGenerateNote}
                       disabled={isGeneratingNote || !formData.title}
@@ -2422,6 +2502,7 @@ export default function App() {
                     </button>
                   </div>
                 </div>
+                {isTuitionBindingOpen && <TuitionBinding accountId={getDraftTuitionAccount()} category={formData.tag} state={tuition.state} results={tuition.results} onChange={accountId => setFormData(current => ({ ...current, pendingTuitionAccountId: accountId, pendingTuitionChanged: true }))} onManage={() => { setStatisticsNow(new Date()); setIsTuitionOpen(true); }} />}
                 <input 
                   type="text" 
                   value={formData.notes || ''} 

@@ -2352,7 +2352,7 @@ export default function App() {
                 </div>
               </div>
               
-              <div className="grid grid-cols-1 sm:grid-cols-[220px_minmax(0,1fr)] gap-5 font-bold">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-5 font-bold">
                 <div className="space-y-2"><TimePicker large label="开始时间（北京时间）" value={formData.startTime} onChange={startTime => setFormData(current => ({ ...current, startTime }))} /><p className="text-[10px] text-slate-400 font-bold">结束时间：{minutesToTime(timeToMinutes(formData.startTime) + Number(formData.duration))}{timeToMinutes(formData.startTime) + Number(formData.duration) >= 1440 ? '（次日）' : ''}</p></div>
                 <div className="space-y-2 min-w-0">
                   <label htmlFor="course-calendar-date" className="flex items-center gap-1 h-6 text-[15px] font-black text-slate-700">上课日期 <span className="text-xs font-normal text-indigo-500">{DAYS[formData.colIndex]}</span></label>

@@ -1,7 +1,10 @@
 import { useState, useMemo, useEffect, useRef, useCallback } from 'react';
 import { clampScheduleZoom, getScheduleFitPercent, getScheduleGridPoint, getScheduleStartMinutes } from './scheduleZoom';
 import MonthlyReports from './MonthlyReports.jsx';
-import TimeZoneConverter, { CourseTimeZonePanel, CourseTimeZoneBadge } from './TimeZoneAssistant.jsx';
+import { filterKnownOccurrences } from './monthlyReports.js';
+import TimeZoneConverter, { CourseTimeZonePanel, CourseTimeZoneBadge, TimePicker } from './TimeZoneAssistant.jsx';
+import { courseDateSelection } from './courseDate.js';
+import { studentTimeZoneDefault } from './studentDefaults.js';
 import { BEIJING_ZONE, occurrenceDate, convertBeijingLesson, beijingPlacement } from './timeZones.js';
 import { Calendar, ChevronLeft, ChevronRight, ChevronDown, Plus, X, Clock, AlertCircle, Download, RefreshCw, Cloud, Copy, FileSpreadsheet, BarChart3, Globe2, Layers, Settings2, Undo, Database, AlignLeft, Sparkles, Bot, Maximize2, Minimize2, LogOut, Lock, Mail } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
@@ -52,7 +55,7 @@ const DAY_THEMES = [
 ];
 
 const DURATION_OPTIONS = [
-  { label: '半小时', value: 30 }, { label: '1小时', value: 60 },
+  { label: '半小时', value: 30 }, { label: '45分钟', value: 45 }, { label: '1小时', value: 60 },
   { label: '1.5小时', value: 90 }, { label: '2小时', value: 120 },
   { label: '2.5小时', value: 150 }, { label: '3小时', value: 180 },
 ];
@@ -61,6 +64,7 @@ const TAGS = {
   A: { label: 'A', badge: 'bg-sky-400', theme: { bg: 'bg-sky-50', text: 'text-slate-800', border: 'border-sky-300' } },
   B: { label: 'B', badge: 'bg-emerald-400', theme: { bg: 'bg-emerald-50', text: 'text-slate-800', border: 'border-emerald-300' } },
   P: { label: 'P', badge: 'bg-rose-400', theme: { bg: 'bg-rose-50', text: 'text-slate-800', border: 'border-rose-300' } },
+  unclassified: { label: '?', badge: 'bg-slate-400', theme: { bg: 'bg-slate-50', text: 'text-slate-800', border: 'border-slate-300' } },
 };
 
 // --- 工具函数 ---
@@ -288,8 +292,7 @@ const normalizeCourse = (rawCourse, index, targetWeekId = currentWeekId) => {
   const name = String(rawCourse.name || rawCourse.title || '').trim();
   const startTime = String(rawCourse.startTime || '').trim();
   const weekday = Number(rawCourse.weekday ?? rawCourse.colIndex);
-  const categoryCandidate = String(rawCourse.category || rawCourse.tag || 'P').trim().toUpperCase();
-  const category = TAGS[categoryCandidate] ? categoryCandidate : 'P';
+  const category = String(rawCourse.category ?? rawCourse.tag ?? '').trim().toUpperCase();
 
   if (!id) throw new Error(`Course ${index + 1} has no id`);
   if (!name) throw new Error(`Course ${id} has no name`);
@@ -346,6 +349,7 @@ const normalizeCourse = (rawCourse, index, targetWeekId = currentWeekId) => {
     }))
     .sort((a, b) => getLessonAnchorKey(a).localeCompare(getLessonAnchorKey(b)));
   const normalized = {
+    ...rawCourse,
     id,
     name,
     title: name,
@@ -380,16 +384,18 @@ const normalizeCourse = (rawCourse, index, targetWeekId = currentWeekId) => {
     try {
       new Intl.DateTimeFormat('zh-CN', { timeZone: rawCourse.studentTimeZone }).format(0);
       normalized.studentTimeZone = rawCourse.studentTimeZone;
-    } catch { /* Invalid legacy timezone metadata must not break course loading. */ }
+    } catch { delete normalized.studentTimeZone; }
   }
+  ['pendingLessonTrackingEnabled', 'pendingLessonNumber', 'studentTimeZoneChanged'].forEach(key => delete normalized[key]);
+  Object.keys(normalized).forEach(key => { if (normalized[key] === undefined) delete normalized[key]; });
 
   return normalized;
 };
 
 const normalizeCourseDataset = (rawData, source, targetWeekId = currentWeekId) => {
   const input = Array.isArray(rawData) ? rawData : rawData?.courses;
-  if (!Array.isArray(input) || input.length === 0) {
-    throw new Error(`${source} did not contain a non-empty course array`);
+  if (!Array.isArray(input)) {
+    throw new Error(`${source} did not contain a course array`);
   }
 
   const validCourses = [];
@@ -409,9 +415,7 @@ const normalizeCourseDataset = (rawData, source, targetWeekId = currentWeekId) =
 
   if (validationErrors.length > 0) {
     console.warn(`[schedule:${source}] rejected invalid courses`, validationErrors);
-  }
-  if (validCourses.length === 0) {
-    throw new Error(`${source} contained no valid courses`);
+    throw new Error(`${source} 有${validationErrors.length}条课程无效，已停止整个操作以保护原数据：${validationErrors[0]}`);
   }
 
   console.info(`[schedule:${source}] transform complete`, {
@@ -441,7 +445,7 @@ const logFirestoreError = (step, error) => {
   }
 };
 
-const replaceFirestoreSchedule = async (userId, rawCourses, source, targetWeekId = currentWeekId) => {
+const replaceFirestoreSchedule = async (userId, rawCourses, source, targetWeekId = currentWeekId, isCurrentUser = () => true) => {
   console.info(`[schedule:${source}] write requested`, { userId });
   const validatedCourses = normalizeCourseDataset(rawCourses, source, targetWeekId);
   const coursesRef = getCoursesRef(userId);
@@ -449,11 +453,16 @@ const replaceFirestoreSchedule = async (userId, rawCourses, source, targetWeekId
   try {
     console.info(`[schedule:${source}] reading existing Firestore courses`);
     const currentSnapshot = await getDocs(coursesRef);
+    if (!isCurrentUser()) throw new Error('账号已改变，已取消恢复操作');
+    if (currentSnapshot.metadata?.fromCache) throw new Error('无法确认云端最新课表，请联网后重试');
+    if (currentSnapshot.size + validatedCourses.length + 2 > 500) throw new Error('课程数量超过一次安全恢复的限制，请先导出备份并联系维护者');
     console.info(`[schedule:${source}] existing Firestore read complete`, {
       documents: currentSnapshot.size,
     });
 
     const batch = writeBatch(db);
+    const previousCourses = currentSnapshot.docs.filter(item => item.id !== '_metadata_').map(item => ({ ...item.data(), id: item.id }));
+    batch.set(doc(db, 'artifacts', FIXED_APP_ID, 'users', userId, 'app_state', 'pre_restore_backup'), { courses: previousCourses, timestamp: Date.now(), source: `before-${source}` });
     currentSnapshot.forEach(snapshotDoc => batch.delete(snapshotDoc.ref));
     validatedCourses.forEach(course => {
       batch.set(doc(coursesRef, course.id), course);
@@ -521,7 +530,13 @@ export default function App() {
     catch { /* Display controls remain usable when browser storage is unavailable. */ }
   }, [zoomPreference]);
   
-  const [courses, setCourses] = useState(() => createDefaultSchedule(currentWeekId));
+  const [courses, setCourses] = useState([]);
+  const [dataState, setDataState] = useState('loading');
+  const [loadError, setLoadError] = useState('');
+  const [loadAttempt, setLoadAttempt] = useState(0);
+  const [authAttempt, setAuthAttempt] = useState(0);
+  const saveInFlightRef = useRef(false);
+  const activeUserIdRef = useRef(null);
   const [statisticsSource, setStatisticsSource] = useState(null);
   const [statisticsNow, setStatisticsNow] = useState(() => new Date());
   const [isStatisticsOpen, setIsStatisticsOpen] = useState(false);
@@ -566,8 +581,11 @@ export default function App() {
   const [user, setUser] = useState(null);
   const [authInitialized, setAuthInitialized] = useState(false);
   const [syncing, setSyncing] = useState(false);
+  const canEdit = Boolean(user) && !loadError && (dataState === 'ready' || (dataState === 'cached' && courses.length > 0));
   const [overlapState, setOverlapState] = useState({});
   const [hideEmptyOverlay, setHideEmptyOverlay] = useState(false);
+  const [scheduleView, setScheduleView] = useState('week');
+  const touchStartRef = useRef(null);
   
   const [isZenMode, setIsZenMode] = useState(false);
   const [isNativeFullscreen, setIsNativeFullscreen] = useState(false);
@@ -590,6 +608,16 @@ export default function App() {
   // -- UI States --
   const [isDownloading, setIsDownloading] = useState(false);
   const [isModalOpen, setIsModalOpen] = useState(false);
+  const courseDialogRef = useRef(null);
+  const courseCloseRef = useRef(null);
+  const initialDraftRef = useRef('');
+  const latestDraftRef = useRef('');
+  const closeCourseDialog = useCallback(() => {
+    if (saveInFlightRef.current) return;
+    if (initialDraftRef.current !== latestDraftRef.current && !window.confirm('还有未保存的修改，确认放弃并关闭？')) return;
+    setIsModalOpen(false);
+  }, []);
+  const [courseDateError, setCourseDateError] = useState('');
   const [courseCelebration, setCourseCelebration] = useState(null);
   useEffect(() => {
     if (!courseCelebration) return;
@@ -599,6 +627,23 @@ export default function App() {
   const [editingCourseId, setEditingCourseId] = useState(null);
   const [formData, setFormData] = useState({ title: '', colIndex: 0, startTime: '10:00', duration: 60, value: 0, recurrence: 'temp', excludedWeeks: [], tag: 'P', notes: '' });
   const [isLessonSettingsModalOpen, setIsLessonSettingsModalOpen] = useState(false);
+  useEffect(() => { latestDraftRef.current = JSON.stringify(formData); }, [formData]);
+  useEffect(() => {
+    if (!isModalOpen || isLessonSettingsModalOpen || zoneConverter) return;
+    const previousFocus = document.activeElement;
+    courseDialogRef.current?.querySelector('input')?.focus();
+    const key = event => {
+      if (event.key === 'Escape') { event.preventDefault(); closeCourseDialog(); }
+      if (event.key !== 'Tab') return;
+      const elements = [...courseDialogRef.current.querySelectorAll('button,input,select,summary')].filter(el => !el.disabled && el.getClientRects().length);
+      if (!elements.length) { event.preventDefault(); return; }
+      const first = elements[0], last = elements.at(-1);
+      if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+      else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+    };
+    window.addEventListener('keydown', key);
+    return () => { window.removeEventListener('keydown', key); if (previousFocus?.isConnected) previousFocus.focus(); };
+  }, [isModalOpen, isLessonSettingsModalOpen, zoneConverter, closeCourseDialog]);
   const [lessonSettingsDraft, setLessonSettingsDraft] = useState({ enabled: false, lessonNumber: 1 });
   const [lessonSettingsStatus, setLessonSettingsStatus] = useState('');
   const [isNameManagerOpen, setIsNameManagerOpen] = useState(false);
@@ -692,148 +737,81 @@ export default function App() {
   };
 
   useEffect(() => {
+    let active = true, unsubscribe = () => {};
     const initAuth = async () => {
       try {
-        const initialAuthToken = globalThis.__initial_auth_token;
-        if (!isStandalone && initialAuthToken) {
-          await signInWithCustomToken(auth, initialAuthToken);
-        } else if (!isStandalone) {
-          await signInAnonymously(auth);
-        }
-        // 如果是 isStandalone，我们只监听状态，不自动匿名登录，以便让用户输入账号密码
-      } catch (e) { console.error(e); }
+        const token = globalThis.__initial_auth_token;
+        if (!isStandalone && token) await signInWithCustomToken(auth, token);
+        else if (!isStandalone) await signInAnonymously(auth);
+        if (!active) return;
+        unsubscribe = onAuthStateChanged(auth, (u) => {
+          if (!active) return;
+          if (activeUserIdRef.current !== (u?.uid || null)) {
+            activeUserIdRef.current = u?.uid || null;
+            setUndoStack([]); setBackupText(''); setBackupStatus('');
+            setIsModalOpen(false); setEditingCourseId(null);
+            setFormData({ title: '', colIndex: 0, startTime: '10:00', duration: 60, value: 0, recurrence: 'temp', excludedWeeks: [], tag: 'P', notes: '' });
+            setIsBackupModalOpen(false); setIsLessonSettingsModalOpen(false);
+            setIsNameManagerOpen(false); setIsTitleDropdownOpen(false);
+            setIsStatisticsOpen(false); setIsReportsOpen(false); setIsExportModalOpen(false);
+            setIsAIModalOpen(false); setScheduleAnalysisResult('');
+            setZoneConverter(null); setMoveConfirmInfo(null); setDragInfo(null);
+            setCourseCelebration(null); setRestoreError(''); setOverlapState({});
+          }
+          setUser(u); setCourses([]); setStatisticsSource(null);
+          setDataState('loading'); setLoadError(''); setAuthError('');
+          setAuthInitialized(true);
+        });
+      } catch (error) {
+        if (!active) return;
+        console.error(error);
+        setUser(null); setCourses([]); setStatisticsSource(null);
+        setAuthError('认证连接失败，请重试或重新登录；未切换到其他用户。');
+        setAuthInitialized(true);
+      }
     };
     initAuth();
-    
-    const unsubscribe = onAuthStateChanged(auth, (u) => {
-      setUser(u);
-      setAuthInitialized(true);
-    });
-    return () => unsubscribe();
-  }, []);
+    return () => { active = false; unsubscribe(); };
+  }, [authAttempt]);
 
   useEffect(() => {
-    if (!user) {
-      console.info('[schedule:init] no authenticated user; using local seed');
-      return;
-    }
-
-    const coursesRef = getCoursesRef(user.uid);
-    let repairInProgress = false;
-
-    const unsubscribe = onSnapshot(coursesRef, async (snap) => {
-      console.info('[schedule:init] Firestore read complete', {
-        userId: user.uid,
-        documents: snap.size,
-      });
-      const docs = snap.docs.filter(d => d.id !== '_metadata_');
-      
-      if (docs.length === 0) {
-        const localFallback = createDefaultSchedule(currentWeekId);
-        console.warn('[schedule:init] Firestore is empty; loading local seed immediately');
-        setCourses(localFallback);
-        setHideEmptyOverlay(true);
-        setSyncing(false);
-
-        if (repairInProgress) return;
-        repairInProgress = true;
-
-        try {
-          const templateRef = collection(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'saved_template');
-          console.info('[schedule:init] reading saved template');
-          const tSnap = await getDocs(templateRef);
-          const currentWId = getWeekId(getMonday(new Date()));
-
-          let restoreSource = 'local-seed';
-          let restoreCourses = localFallback;
-          if (!tSnap.empty) {
-            console.info('[schedule:init] saved template found', { documents: tSnap.size });
-            const templateCourses = tSnap.docs.map(templateDoc => ({
-              id: templateDoc.id,
-              ...templateDoc.data(),
-            }));
-            restoreCourses = normalizeCourseDataset(templateCourses, 'saved-template', currentWId);
-            restoreSource = 'saved-template';
-            setCourses(restoreCourses);
-          } else {
-            console.info('[schedule:init] no saved template found; using local seed');
-          }
-
-          await replaceFirestoreSchedule(user.uid, restoreCourses, `auto-${restoreSource}`, currentWId);
-          setRestoreError('');
-        } catch (error) {
-          logFirestoreError('init:auto-restore', error);
-          console.warn('[schedule:init] cloud repair failed; local seed remains active');
-          setCourses(localFallback);
-        } finally {
-          repairInProgress = false;
-          setSyncing(false);
-        }
-      } else {
-        let list;
-        let rawCourses;
-        try {
-          rawCourses = docs.map(d => ({ id: d.id, ...d.data() }));
-          list = normalizeCourseDataset(rawCourses, 'firestore-snapshot', currentWeekId);
-          // 原始类别及完成状态只用于内存统计，不加入 Firestore 数据结构。
-          setStatisticsSource(rawCourses);
-        } catch (error) {
-          console.error('[schedule:init] Firestore data was unusable; falling back to local seed', error);
-          setCourses(createDefaultSchedule(currentWeekId));
-          setHideEmptyOverlay(true);
-          setSyncing(false);
-          return;
-        }
-
-        const requiresSchemaMigration = rawCourses.some(course =>
-          !Object.hasOwn(course, 'name')
-          || !Object.hasOwn(course, 'duration')
-          || !Object.hasOwn(course, 'weekday')
-          || !Object.hasOwn(course, 'price')
-          || !Object.hasOwn(course, 'category')
-          || !Object.hasOwn(course, 'lessonTrackingEnabled')
-          || !Object.hasOwn(course, 'lessonCycleStarts')
-        );
-
-        if (requiresSchemaMigration) {
-          try {
-            console.info('[schedule:init] repairing Firestore schedule structure', {
-              migrateExisting: true,
-            });
-            const batch = writeBatch(db);
-            list.forEach(course => batch.set(doc(coursesRef, course.id), course));
-            batch.set(doc(coursesRef, '_metadata_'), {
-              last: Date.now(),
-              count: list.length,
-              schemaVersion: COURSE_SCHEMA_VERSION,
-              source: 'schema-migration',
-            });
-            await batch.commit();
-            setCourses(list);
-          } catch (error) {
-            logFirestoreError('init:schema-repair', error);
-            setCourses(list);
-          }
-        } else {
-          setCourses(list);
-        }
-        setSyncing(false);
+    if (!user) return;
+    let active = true;
+    const unsubscribe = onSnapshot(getCoursesRef(user.uid), { includeMetadataChanges: true }, (snap) => {
+      if (!active) return;
+      const rawCourses = snap.docs.filter(item => item.id !== '_metadata_').map(item => ({ ...item.data(), id: item.id }));
+      if (snap.metadata?.fromCache && rawCourses.length === 0) {
+        setDataState('loading');
+        setLoadError('本地缓存中暂无课表，正在等待云端确认。请联网后重试；未清空云端课程。');
+        return;
+      }
+      try {
+        // Loading is strictly read-only, including empty accounts and legacy records.
+        const list = normalizeCourseDataset(rawCourses, 'firestore-snapshot', currentWeekId);
+        setCourses(list);
+        setStatisticsSource(rawCourses);
+        setDataState(snap.metadata?.fromCache ? 'cached' : 'ready');
+        setLoadError('');
+        setHideEmptyOverlay(false);
+      } catch (error) {
+        logFirestoreError('snapshot:validation', error);
+        setDataState('error');
+        setLoadError(`课表读取校验失败，未修改云端数据：${error.message}`);
       }
     }, (error) => {
-      logFirestoreError('init:snapshot-read', error);
-      console.warn('[schedule:init] Firestore listener failed; using local seed');
-      setCourses(createDefaultSchedule(currentWeekId));
-      setHideEmptyOverlay(true);
-      setSyncing(false); 
+      if (!active) return;
+      logFirestoreError('snapshot:read', error);
+      setDataState('error');
+      setLoadError('无法读取云端课表，已保留当前显示内容。请检查网络或权限后重试，暂不可编辑。');
     });
-    return () => unsubscribe();
-  }, [user]);
+    return () => { active = false; unsubscribe(); };
+  }, [user, loadAttempt]);
 
   const coursesRefLatest = useRef(courses);
   useEffect(() => { coursesRefLatest.current = courses; }, [courses]);
 
   const viewWeekId = getWeekId(viewWeekStart);
-  const isViewingCurrentWeek = viewWeekId === currentWeekId;
+  const isViewingCurrentWeek = viewWeekId === getWeekId(getMonday(statisticsNow));
 
   const lessonSettingsByTitle = useMemo(() => {
     const settings = new Map();
@@ -991,32 +969,6 @@ export default function App() {
     return { daily, dailyDuration, weekly };
   }, [visibleCourses, viewWeekStart]);
 
-  const monthlyTotal = useMemo(() => {
-    const thurs = new Date(viewWeekStart); thurs.setDate(thurs.getDate() + 3);
-    const y = thurs.getFullYear(), m = thurs.getMonth(), days = new Date(y, m + 1, 0).getDate(), today = new Date();
-    today.setHours(0,0,0,0);
-    let t = 0;
-    for (let i = 1; i <= days; i++) {
-      const cd = new Date(y, m, i); cd.setHours(0,0,0,0);
-      if (cd > today) continue; 
-      const ci = cd.getDay() === 0 ? 6 : cd.getDay() - 1, wid = getWeekId(getMonday(cd));
-      courses.forEach(c => {
-        if (c.colIndex === ci) {
-          let active;
-          if (c.isFixed) {
-            const isAfterStart = c.baseWeekId ? wid >= c.baseWeekId : true;
-            const isBeforeEnd = c.endWeekId ? wid < c.endWeekId : true;
-            active = isAfterStart && isBeforeEnd && !(c.excludedWeeks?.includes(wid)) && (!c.isBiweekly || getDiffWeeks(c.baseWeekId, wid) % 2 === 0);
-          } else {
-            active = c.weekId === wid;
-          }
-          if (active) t += getCourseTotalValue(c, cd);
-        }
-      });
-    }
-    return { val: t, month: m + 1 };
-  }, [courses, viewWeekStart]);
-
   const statisticsCourses = useMemo(() => {
     const originals = new Map((statisticsSource || []).map(course => [course.id, course]));
     return courses.map(course => {
@@ -1026,16 +978,16 @@ export default function App() {
   }, [courses, statisticsSource]);
   const completedSummary = useMemo(() => {
     const monthRange = getStatisticsRange('month', statisticsNow);
-    const lessons = collectCompletedLessons(statisticsCourses, monthRange, statisticsNow);
+    const { lessons, undatedCount } = filterKnownOccurrences(statisticsCourses, collectCompletedLessons(statisticsCourses, monthRange, statisticsNow), statisticsNow);
     const monday = getMonday(statisticsNow).getTime();
     // 跨月的一周需要单独读取整周，不能只过滤本月记录。
     const weekLessons = parseLocalDate(monthRange.start).getTime() > monday
-      ? collectCompletedLessons(statisticsCourses, getStatisticsRange('week', statisticsNow), statisticsNow)
+      ? filterKnownOccurrences(statisticsCourses, collectCompletedLessons(statisticsCourses, getStatisticsRange('week', statisticsNow), statisticsNow), statisticsNow).lessons
       : lessons.filter(lesson => lesson.startsAt >= monday);
-    return { week: weekLessons.reduce((sum, lesson) => sum + lesson.minutes, 0), month: lessons.reduce((sum, lesson) => sum + lesson.minutes, 0) };
+    return { week: weekLessons.reduce((sum, lesson) => sum + lesson.minutes, 0), month: lessons.reduce((sum, lesson) => sum + lesson.minutes, 0), fee: lessons.reduce((sum, lesson) => sum + lesson.fee, 0), undatedCount };
   }, [statisticsCourses, statisticsNow]);
   const statisticsResult = useMemo(() => isStatisticsOpen
-    ? summarizeCompletedLessons(collectCompletedLessons(statisticsCourses, statisticsRange, statisticsNow))
+    ? summarizeCompletedLessons(filterKnownOccurrences(statisticsCourses, collectCompletedLessons(statisticsCourses, statisticsRange, statisticsNow), statisticsNow).lessons)
     : null, [statisticsCourses, statisticsRange, statisticsNow, isStatisticsOpen]);
   const queryStatistics = (event) => {
     event.preventDefault();
@@ -1098,8 +1050,9 @@ export default function App() {
   const saveSnapshotForUndo = () => setUndoStack(prev => [...prev, JSON.parse(JSON.stringify(coursesRefLatest.current))]);
 
   const handleUndo = async () => {
+    if (!canEdit || syncing || saveInFlightRef.current) return;
     if (undoStack.length === 0 || !user) return;
-    setSyncing(true);
+    saveInFlightRef.current = true; setRestoreError(''); setSyncing(true);
     try {
       const previousCourses = undoStack[undoStack.length - 1];
       const batch = writeBatch(db);
@@ -1107,10 +1060,28 @@ export default function App() {
       previousCourses.forEach(c => batch.set(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', c.id), c));
       await batch.commit();
       setUndoStack(prev => prev.slice(0, -1));
-    } catch (e) { console.error(e); } finally { setSyncing(false); }
+    } catch (e) { console.error(e); setRestoreError(`撤销未完成：${e.message}`); } finally { saveInFlightRef.current = false; setSyncing(false); }
   };
 
+  const openModal = useCallback((course = null, colIdx = 0, defaultStartTime = '10:00') => {
+    if (!canEdit || saveInFlightRef.current) { setRestoreError('请先等待课表读取或当前操作完成。'); return; }
+    setCourseDateError('');
+    setIsNameManagerOpen(false); setIsTitleDropdownOpen(false); setDeleteConfirmTitle(null);
+    let draft;
+    if (course) {
+      let dur = timeToMinutes(course.endTime) - timeToMinutes(course.startTime); if (dur < 0) dur += 1440;
+      setEditingCourseId(course.id); draft = { ...course, duration: dur, recurrence: course.isBiweekly ? 'biweekly' : (course.isFixed ? 'weekly' : 'temp'), notes: course.notes || '' };
+    } else {
+      setEditingCourseId(null); draft = { title: '', colIndex: colIdx, startTime: defaultStartTime, duration: 60, value: 400, recurrence: 'temp', excludedWeeks: [], lessonTrackingEnabled: false, lessonCycleStarts: [], lessonTrackingAnchors: [], tag: 'P', notes: '' };
+    }
+    initialDraftRef.current = JSON.stringify(draft);
+    latestDraftRef.current = initialDraftRef.current;
+    setFormData(draft);
+    setIsModalOpen(true);
+  }, [canEdit, setRestoreError, setCourseDateError, setIsNameManagerOpen, setIsTitleDropdownOpen, setDeleteConfirmTitle, setEditingCourseId, setFormData, setIsModalOpen]);
+
   const handleCourseMouseDown = (e, course) => {
+    if (!canEdit || syncing || saveInFlightRef.current || (touchStartRef.current && e.timeStamp - touchStartRef.current.at < 600)) return;
     if (e.button !== 0 && e.button !== 2) return;
     if (e.target.closest('button')) return;
     e.stopPropagation(); e.preventDefault(); 
@@ -1127,7 +1098,7 @@ export default function App() {
         if (e.button === 0) openModal(course);
         setDragInfo(null); return;
       }
-      if (!gridBodyRef.current || !user) { setDragInfo(null); return; }
+      if (!gridBodyRef.current || !user || !canEdit || syncing || saveInFlightRef.current) { setDragInfo(null); return; }
       
       const rect = gridBodyRef.current.getBoundingClientRect();
       const scale = rect.width / gridBodyRef.current.offsetWidth;
@@ -1139,7 +1110,7 @@ export default function App() {
       const actualDur = durMins > 0 ? durMins : durMins + 1440;
       
       const newStartMins = getScheduleStartMinutes(point.y - dragInfo.offsetY / scale, {
-        startHour: START_HOUR, endHour: END_HOUR, pixelsPerHour: PIXELS_PER_HOUR, duration: actualDur, snap: 'round',
+        startHour: START_HOUR, endHour: END_HOUR + 1, pixelsPerHour: PIXELS_PER_HOUR, duration: actualDur, snap: 'round',
       });
       const newStartTime = minutesToTime(newStartMins);
       const newEndTime = minutesToTime(newStartMins + actualDur);
@@ -1150,7 +1121,7 @@ export default function App() {
                setMoveConfirmInfo({ course, newColIdx: colIdx, newStartTime, newEndTime });
                setDragInfo(null); return; 
             }
-            saveSnapshotForUndo(); setSyncing(true);
+            saveInFlightRef.current = true; setRestoreError(''); saveSnapshotForUndo(); setSyncing(true);
             try {
               await updateDoc(doc(db, `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${course.id}`), {
                 colIndex: colIdx,
@@ -1161,20 +1132,24 @@ export default function App() {
               });
             } catch (error) {
               logFirestoreError('course:move', error);
+              setRestoreError(`移动未完成：${error.message}`);
             } finally {
+              saveInFlightRef.current = false;
               setSyncing(false);
             }
          } else if (action === 'copy') {
-            saveSnapshotForUndo(); setSyncing(true);
+            saveInFlightRef.current = true; setRestoreError(''); saveSnapshotForUndo(); setSyncing(true);
             try {
                const newId = Math.random().toString(36).substr(2, 9);
-               const newData = { ...course, id: newId, colIndex: colIdx, startTime: newStartTime, endTime: newEndTime };
+               const newData = { ...course, id: newId, colIndex: colIdx, weekday: colIdx, startTime: newStartTime, endTime: newEndTime };
                if (!newData.isFixed) { newData.weekId = viewWeekId; delete newData.baseWeekId; } else { newData.weekId = null; newData.baseWeekId = viewWeekId; }
                const validatedCopy = normalizeCourse(newData, 0, viewWeekId);
                await setDoc(doc(db, `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${newId}`), validatedCopy);
             } catch (error) {
               logFirestoreError('course:copy', error);
+               setRestoreError(`复制未完成：${error.message}`);
             } finally {
+               saveInFlightRef.current = false;
               setSyncing(false);
             }
          }
@@ -1185,10 +1160,11 @@ export default function App() {
     window.addEventListener('mousemove', handleMouseMove);
     window.addEventListener('mouseup', handleMouseUp);
     return () => { window.removeEventListener('mousemove', handleMouseMove); window.removeEventListener('mouseup', handleMouseUp); };
-  }, [dragInfo, viewWeekId, user]);
+  }, [dragInfo, viewWeekId, user, openModal, canEdit, syncing]);
 
   const handleConfirmMove = async (type) => {
-    if (!moveConfirmInfo || !user) return;
+    if (!moveConfirmInfo || !user || !canEdit || syncing || saveInFlightRef.current) return;
+    saveInFlightRef.current = true; setRestoreError('');
     saveSnapshotForUndo(); setSyncing(true);
     const { course, newColIdx, newStartTime, newEndTime } = moveConfirmInfo;
     try {
@@ -1197,7 +1173,7 @@ export default function App() {
         const originalPath = `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${course.id}`;
         batch.update(doc(db, originalPath), { excludedWeeks: arrayUnion(viewWeekId) });
         const newId = Math.random().toString(36).substr(2, 9);
-        const tempCourse = { ...course, id: newId, colIndex: newColIdx, startTime: newStartTime, endTime: newEndTime, isFixed: false, isBiweekly: false, weekId: viewWeekId, recurrence: 'temp' };
+        const tempCourse = { ...course, id: newId, colIndex: newColIdx, weekday: newColIdx, startTime: newStartTime, endTime: newEndTime, isFixed: false, isBiweekly: false, weekId: viewWeekId, recurrence: 'temp' };
         delete tempCourse.baseWeekId; delete tempCourse.excludedWeeks;
         batch.set(
           doc(db, `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${newId}`),
@@ -1206,25 +1182,27 @@ export default function App() {
       } else if (type === 'permanent') {
         let duration = timeToMinutes(newEndTime) - timeToMinutes(newStartTime);
         if (duration <= 0) duration += 1440;
-        batch.update(doc(db, `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${course.id}`), {
-          colIndex: newColIdx,
-          weekday: newColIdx,
-          startTime: newStartTime,
-          endTime: newEndTime,
-          duration,
-        });
+        const past = !course.baseWeekId || course.baseWeekId < viewWeekId;
+        const futureId = past ? Math.random().toString(36).slice(2, 11) : course.id;
+        if (past) batch.update(doc(db, `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${course.id}`), { endWeekId: viewWeekId, excludedWeeks: (course.excludedWeeks || []).filter(week => week < viewWeekId) });
+        batch.set(doc(db, `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${futureId}`), normalizeCourse({ ...course, id: futureId, colIndex: newColIdx, weekday: newColIdx, startTime: newStartTime, endTime: newEndTime, duration, baseWeekId: viewWeekId, excludedWeeks: (course.excludedWeeks || []).filter(week => week >= viewWeekId) }, 0, viewWeekId));
       }
       await batch.commit();
     } catch (error) {
       logFirestoreError('course:confirm-move', error);
+      setRestoreError(`调课未完成：${error.message}`);
     } finally {
+      saveInFlightRef.current = false;
       setSyncing(false);
       setMoveConfirmInfo(null);
     }
   };
 
   const handleUpdateTemplate = async () => {
-    if (!user || courses.length === 0) return;
+    if (!user || !canEdit || syncing || isSavingTemplate || saveInFlightRef.current) return;
+    if (!window.confirm(`确认保存当前${courses.length}条课程为最新云端备份？这会替换上次的最新备份。`)) return;
+    saveInFlightRef.current = true;
+    setRestoreError('');
     setIsSavingTemplate('saving');
     try {
       console.info('[schedule:backup] validating current schedule');
@@ -1246,108 +1224,49 @@ export default function App() {
     } catch (error) {
       logFirestoreError('backup:write', error);
       setIsSavingTemplate(false);
+      setRestoreError(`备份保存失败，原课程未改变：${error.message}`);
+    } finally {
+      saveInFlightRef.current = false;
     }
   };
 
-  const restoreLatestSchedule = async () => {
-    const localFallback = createDefaultSchedule(viewWeekId);
-    saveSnapshotForUndo();
-    setSyncing(true);
-    setRestoreError('');
-
-    if (!user) {
-      console.warn('[schedule:restore] no authenticated user; using local seed');
-      setCourses(localFallback);
-      setHideEmptyOverlay(true);
-      setSyncing(false);
-      return;
-    }
-
+  const restoreLatestSchedule = async (backupId = 'latest_backup') => {
+    if (!user || !canEdit || syncing || saveInFlightRef.current) return;
+    saveInFlightRef.current = true;
+    setSyncing(true); setRestoreError('');
     try {
-      console.info('[schedule:restore] reading latest backup', { userId: user.uid });
-      const backupSnap = await getDoc(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'app_state', 'latest_backup'));
-      if (!backupSnap.exists()) throw new Error('Latest backup document does not exist');
-
+      const key = backupId === 'pre_restore_backup' ? 'pre_restore_backup' : 'latest_backup';
+      const backupSnap = await getDoc(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'app_state', key));
+      if (!backupSnap.exists()) throw new Error('找不到云端备份');
       const backupData = backupSnap.data();
-      console.info('[schedule:restore] backup read complete', {
-        hasCoursesArray: Array.isArray(backupData.courses),
-        hasLegacyCode: typeof backupData.code === 'string',
-      });
-
-      let rawCourses = backupData.courses;
-      if (!Array.isArray(rawCourses) && typeof backupData.code === 'string') {
-        console.info('[schedule:restore] parsing legacy backup code');
-        rawCourses = JSON.parse(backupData.code);
-      }
-
+      const rawCourses = Array.isArray(backupData.courses) ? backupData.courses : JSON.parse(backupData.code || 'null');
       const validatedCourses = normalizeCourseDataset(rawCourses, 'latest-backup', viewWeekId);
-      const restoredCourses = await replaceFirestoreSchedule(
-        user.uid,
-        validatedCourses,
-        'latest-backup',
-        viewWeekId,
-      );
-
-      setCourses(restoredCourses);
-      setHideEmptyOverlay(true);
-      setRestoreError('');
-      console.info('[schedule:restore] latest schedule restored successfully');
+      if (!window.confirm(`确认用备份的${validatedCourses.length}条课程替换当前课表？当前云端记录会先原子保存为恢复前副本。`)) return;
+      saveSnapshotForUndo();
+      if (activeUserIdRef.current !== user.uid) return;
+      const restored = await replaceFirestoreSchedule(user.uid, validatedCourses, 'latest-backup', viewWeekId, () => activeUserIdRef.current === user.uid);
+      if (activeUserIdRef.current !== user.uid) return;
+      setCourses(restored); setHideEmptyOverlay(true);
     } catch (error) {
       logFirestoreError('restore:latest-backup', error);
-      console.warn('[schedule:restore] latest backup unavailable; falling back to local seed');
-      setCourses(localFallback);
-      setHideEmptyOverlay(true);
-
-      try {
-        await replaceFirestoreSchedule(user.uid, localFallback, 'restore-local-fallback', viewWeekId);
-        console.info('[schedule:restore] local fallback also persisted to Firestore');
-      } catch (writeError) {
-        logFirestoreError('restore:local-fallback-write', writeError);
-        console.warn('[schedule:restore] local fallback remains active in memory only');
-      }
-
-      setRestoreError('云端备份不可用，已加载本地默认课表。');
-      setTimeout(() => setRestoreError(''), 4000);
-    } finally {
-      setSyncing(false);
-    }
+      setRestoreError(`恢复未完成，原课表保持不变：${error.message}`);
+    } finally { saveInFlightRef.current = false; setSyncing(false); }
   };
 
   const restoreInitialData = async () => {
-    const localSeed = createDefaultSchedule(viewWeekId);
-    saveSnapshotForUndo();
-    setSyncing(true);
-    setRestoreError('');
-
-    if (!user) {
-      console.warn('[schedule:initialize] no authenticated user; using local seed');
-      setCourses(localSeed);
-      setHideEmptyOverlay(true);
-      setSyncing(false);
-      return;
-    }
-
+    if (!user || !canEdit || syncing || saveInFlightRef.current) return;
+    if (!window.confirm('确认载入示例课表？这会替换当前课程，并先保存恢复前副本。日常新增无需初始化。')) return;
+    saveInFlightRef.current = true; setSyncing(true); setRestoreError('');
     try {
-      console.info('[schedule:initialize] restoring local seed');
-      const initializedCourses = await replaceFirestoreSchedule(
-        user.uid,
-        localSeed,
-        'manual-local-seed',
-        viewWeekId,
-      );
-      setCourses(initializedCourses);
-      setHideEmptyOverlay(true);
-      console.info('[schedule:initialize] local seed initialization complete');
+      const localSeed = createDefaultSchedule(viewWeekId);
+      saveSnapshotForUndo();
+      const initialized = await replaceFirestoreSchedule(user.uid, localSeed, 'manual-local-seed', viewWeekId, () => activeUserIdRef.current === user.uid);
+      if (activeUserIdRef.current !== user.uid) return;
+      setCourses(initialized); setHideEmptyOverlay(true);
     } catch (error) {
       logFirestoreError('initialize:local-seed', error);
-      console.warn('[schedule:initialize] Firestore write failed; local seed remains active');
-      setCourses(localSeed);
-      setHideEmptyOverlay(true);
-      setRestoreError('云端写入失败，已在本地加载默认课表。');
-      setTimeout(() => setRestoreError(''), 4000);
-    } finally {
-      setSyncing(false);
-    }
+      setRestoreError(`初始化未完成，原课表保持不变：${error.message}`);
+    } finally { saveInFlightRef.current = false; setSyncing(false); }
   };
 
   const handleCopyBackup = () => {
@@ -1358,11 +1277,14 @@ export default function App() {
   };
 
   const handleImportBackup = async () => {
-    if (!backupText.trim() || !user) { setBackupStatus('❌ 请先粘贴代码'); return; }
+    if (!backupText.trim() || !user || !canEdit) { setBackupStatus('❌ 请先确认课表已加载并粘贴有效备份'); return; }
+    if (saveInFlightRef.current || syncing) return;
+    saveInFlightRef.current = true;
     try {
       console.info('[schedule:manual-import] parsing backup text');
       const parsed = JSON.parse(backupText);
       const validatedCourses = normalizeCourseDataset(parsed, 'manual-import', viewWeekId);
+      if (!window.confirm(`确认用导入的${validatedCourses.length}条课程替换当前课表？原记录将先保存恢复前副本。`)) return;
       saveSnapshotForUndo();
       setSyncing(true);
       const restoredCourses = await replaceFirestoreSchedule(
@@ -1370,14 +1292,17 @@ export default function App() {
         validatedCourses,
         'manual-import',
         viewWeekId,
+        () => activeUserIdRef.current === user.uid,
       );
+      if (activeUserIdRef.current !== user.uid) return;
       setCourses(restoredCourses);
       setBackupStatus('✅ 数据已成功恢复！');
-      setTimeout(() => { setIsBackupModalOpen(false); setBackupStatus(''); setHideEmptyOverlay(true); }, 1500);
+      setTimeout(() => { if (activeUserIdRef.current !== user.uid) return; setIsBackupModalOpen(false); setBackupStatus(''); setHideEmptyOverlay(true); }, 1500);
     } catch (error) {
       logFirestoreError('manual-import', error);
       setBackupStatus(`❌ 恢复失败：${error.message}`);
     } finally {
+      saveInFlightRef.current = false;
       setSyncing(false);
     }
   };
@@ -1415,19 +1340,8 @@ export default function App() {
       || matchingCourses[0];
   };
 
-  function openModal(course = null, colIdx = 0, defaultStartTime = '10:00') {
-    setIsNameManagerOpen(false); setIsTitleDropdownOpen(false); setDeleteConfirmTitle(null);
-    if (course) {
-      let dur = timeToMinutes(course.endTime) - timeToMinutes(course.startTime); if (dur < 0) dur += 1440;
-      setEditingCourseId(course.id); setFormData({ ...course, duration: dur, recurrence: course.isBiweekly ? 'biweekly' : (course.isFixed ? 'weekly' : 'temp'), notes: course.notes || '' });
-    } else {
-      setEditingCourseId(null); setFormData({ title: '', colIndex: colIdx, startTime: defaultStartTime, duration: 60, value: 400, recurrence: 'temp', excludedWeeks: [], lessonTrackingEnabled: false, lessonCycleStarts: [], lessonTrackingAnchors: [], tag: 'P', notes: '' });
-    }
-    setIsModalOpen(true);
-  }
-
   const openTimeZoneConverter = (initial = {}) => {
-    const today = beijingPlacement(Date.now());
+    const today = beijingPlacement(statisticsNow.getTime());
     setZoneConverter({ date: today.weekId === viewWeekId ? today.date : viewWeekId, time: '20:00', timeZone: BEIJING_ZONE, duration: 60, context: 'new', ...initial });
   };
   const openCourseTimeZone = (course, preview) => {
@@ -1435,30 +1349,39 @@ export default function App() {
     openTimeZoneConverter({ date: preview.start.date, time: preview.start.time, timeZone: course.studentTimeZone, duration, studentTimeZone: course.studentTimeZone, instant: preview.instant });
   };
   const applyConvertedTime = ({ instant, duration, studentTimeZone }) => {
+    if (!canEdit || syncing || saveInFlightRef.current) return '课表尚未就绪或正在保存，请稍后再应用。';
     const placement = beijingPlacement(instant);
     if (!placement) return '换算时间无效，请重新选择。';
     const start = timeToMinutes(placement.startTime);
-    if (start < START_HOUR * 60 || start + duration > END_HOUR * 60) return `换算结果超出当前课表的${START_HOUR}:00—${END_HOUR}:00排课范围，请调整时间后再应用。`;
+    if (start < START_HOUR * 60 || start + duration > (END_HOUR + 1) * 60) setScheduleView('list');
     if (zoneConverter.context === 'editor' && editingCourseId && placement.weekId !== viewWeekId) return '换算结果属于其他周。为保留当前课程，请调整日期至正在编辑的这一周，或从顶部换算入口新增课程。';
     if (zoneConverter.context !== 'editor') openModal(null, placement.colIndex, placement.startTime);
     if (placement.weekId !== viewWeekId) {
       const [year, month, day] = placement.weekId.split('-').map(Number);
       setViewWeekStart(new Date(year, month - 1, day));
     }
-    setFormData(current => ({ ...current, colIndex: placement.colIndex, startTime: placement.startTime, duration, studentTimeZone }));
+    setFormData(current => ({ ...current, colIndex: placement.colIndex, weekday: placement.colIndex, startTime: placement.startTime, duration, studentTimeZone, studentTimeZoneChanged: current.studentTimeZone !== studentTimeZone }));
     setZoneConverter(null);
     return '';
   };
 
   const handleSave = async (isDuplicate = false) => {
-    if (!formData.title.trim() || !user) return;
+    if (saveInFlightRef.current) return;
+    if (!formData.title.trim()) { setRestoreError('请填写课程名称'); return; }
+    if (!user || !canEdit) { setRestoreError('课表尚未确认加载，请先检查登录、网络或读取错误。'); return; }
+    const startMinutes = timeToMinutes(formData.startTime);
+    if (!COURSE_TIME_PATTERN.test(formData.startTime) || !Number.isFinite(Number(formData.duration)) || Number(formData.duration) <= 0 || Number(formData.duration) > 1440) { setRestoreError('请选择有效的开始时间和不超过24小时的课程时长。'); return; }
+    saveInFlightRef.current = true;
+    setRestoreError('');
     saveSnapshotForUndo(); setSyncing(true);
     const original = editingCourseId ? courses.find(c => c.id === editingCourseId) : null;
     const targetId = (isDuplicate || !editingCourseId) ? Math.random().toString(36).substr(2, 9) : editingCourseId;
     const data = { ...formData, id: targetId, endTime: minutesToTime(timeToMinutes(formData.startTime) + Number(formData.duration)) };
+    data.weekday = Number(data.colIndex);
     data.name = formData.title.trim();
     data.price = Number(formData.value);
     data.category = formData.tag;
+    if (formData.studentTimeZoneChanged) data.studentTimeZoneUpdatedAt = Date.now();
     const learnerLessonSettings = lessonSettingsByTitle.get(formData.title.trim());
     const nextLessonEnabled = typeof formData.pendingLessonTrackingEnabled === 'boolean'
       ? formData.pendingLessonTrackingEnabled
@@ -1496,8 +1419,13 @@ export default function App() {
         && original.title === data.title.trim()
         && priceChanged;
       const shouldPreserveCategoryHistory = !isDuplicate && original?.isFixed && categoryChanged;
+      const shouldPreserveScheduleHistory = !isDuplicate && original?.isFixed && (
+        Number(original.colIndex) !== Number(data.colIndex)
+        || original.startTime !== data.startTime || original.endTime !== data.endTime
+        || Boolean(original.isBiweekly) !== Boolean(data.isBiweekly) || !data.isFixed
+      );
 
-      if (shouldApplyPriceFromCurrentCourse || shouldPreserveCategoryHistory) {
+      if (shouldApplyPriceFromCurrentCourse || shouldPreserveCategoryHistory || shouldPreserveScheduleHistory) {
         const batch = writeBatch(db);
         // 调价沿用同名课程的未来计价规则；类别只改变当前选中的循环课程。
         const affectedCourses = shouldApplyPriceFromCurrentCourse
@@ -1590,6 +1518,8 @@ export default function App() {
         });
 
         await batch.commit();
+        if (activeUserIdRef.current !== user.uid) return;
+        if (startMinutes < 480 || startMinutes + Number(formData.duration) > 1440) setScheduleView('list');
         console.info('[schedule:course-save] exact course history update complete', {
           title: original.title,
           effectiveOccurrence: priceEffectiveOccurrence,
@@ -1614,21 +1544,25 @@ export default function App() {
         });
       }
       await batch.commit();
+      if (activeUserIdRef.current !== user.uid) return;
+      if (startMinutes < 480 || startMinutes + Number(formData.duration) > 1440) setScheduleView('list');
       setIsModalOpen(false);
       if ((!editingCourseId || isDuplicate) && validatedCourse.category === 'P') {
         setCourseCelebration({ type: validatedCourse.isFixed ? 'flower' : 'ingot', id: targetId });
       }
     } catch (error) {
       logFirestoreError('course:save', error);
-      setRestoreError(`课程保存失败：${error.message}`);
-      setTimeout(() => setRestoreError(''), 4000);
+      if (activeUserIdRef.current === user.uid) setRestoreError(`课程保存失败：${error.message}`);
     } finally {
+      saveInFlightRef.current = false;
       setSyncing(false);
     }
   };
 
   const performDelete = async (id, force = false) => {
-    const c = courses.find(item => item.id === id); if (!c || !user) return;
+    const c = courses.find(item => item.id === id); if (!c || !user || !canEdit || saveInFlightRef.current || syncing) return;
+    if (!window.confirm(c.isFixed ? force ? `确认从本周结束“${c.title}”的固定排课？` : `确认取消“${c.title}”本周的这一节课？其他周不变。` : `确认删除“${c.title}”这节临时课程？`)) return;
+    saveInFlightRef.current = true; setRestoreError('');
     saveSnapshotForUndo(); setSyncing(true);
     const path = `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${id}`;
     
@@ -1647,11 +1581,13 @@ export default function App() {
       } else {
         await deleteDoc(doc(db, path));
       }
+      setIsModalOpen(false);
     } catch (e) {
       console.error(e);
+      setRestoreError(`删除未完成：${e.message}`);
     } finally {
+      saveInFlightRef.current = false;
       setOverlapState({}); 
-      setIsModalOpen(false);
       setSyncing(false);
     }
   };
@@ -1791,6 +1727,10 @@ export default function App() {
     return <div className="h-screen w-full flex items-center justify-center bg-slate-50"><RefreshCw className="animate-spin text-indigo-500" size={32} /></div>;
   }
 
+  if (!user && !isStandalone) {
+    return <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6"><section className="bg-white border border-slate-200 rounded-2xl p-8 max-w-md text-center shadow-sm"><Lock className="mx-auto text-indigo-500 mb-4" size={30} /><h1 className="text-xl font-black">需要验证身份</h1><p role="alert" className="text-sm text-slate-500 my-4">{authError || '尚未连接到你的账户，已暂停读取和编辑，避免显示其他用户或示例课表。'}</p><button onClick={() => { setAuthInitialized(false); setAuthError(''); setAuthAttempt(value => value + 1); }} className="px-5 py-3 rounded-xl bg-indigo-600 text-white font-bold">重新连接</button></section></div>;
+  }
+
   if (!user && isStandalone) {
     return (
       <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-indigo-50 to-slate-100 p-4 font-sans text-slate-800">
@@ -1890,12 +1830,11 @@ export default function App() {
               <div>
                 <h1 className="text-xl font-black text-slate-800 tracking-tight flex items-center gap-3">
                   每周固定课表
-                  {syncing ? <span className="text-[10px] text-amber-600 bg-amber-50 px-2 py-0.5 rounded border border-amber-100 flex items-center gap-1"><RefreshCw size={10} className="animate-spin"/> 同步中</span> 
-                  : <span className="text-[10px] text-green-600 bg-green-50 px-2 py-0.5 rounded border border-green-100 flex items-center gap-1"><Cloud size={10}/> 已保存</span>}
+                  <span role="status" className={`text-[10px] px-2 py-0.5 rounded border flex items-center gap-1 ${restoreError || loadError ? 'text-red-600 bg-red-50 border-red-100' : syncing || dataState !== 'ready' ? 'text-amber-700 bg-amber-50 border-amber-100' : 'text-teal-600 bg-teal-50 border-teal-100'}`}>{syncing ? <RefreshCw size={10} className="animate-spin" /> : <Cloud size={10} />}{restoreError || loadError ? '操作未完成' : syncing ? '等待云端确认' : dataState === 'loading' ? '正在读取' : dataState === 'cached' ? '离线缓存' : '云端已同步'}</span>
                 </h1>
                 <div className="text-sm font-bold text-purple-600 flex flex-wrap items-center gap-x-4 gap-y-2 mt-1">
-                  <span>本周: ¥{String(totals.weekly)}</span>
-                  <span>{String(monthlyTotal.month)}月已上: ¥{String(monthlyTotal.val)}</span>
+                  <span>本周排课预计: ¥{String(totals.weekly)}</span>
+                  <span>本月已完成课酬: ¥{String(completedSummary.fee)}</span>
                 </div>
                 <div className="text-sm font-bold text-teal-700 flex flex-wrap items-center gap-x-4 gap-y-2 mt-2">
                   <span>本周已上课时：{formatLessonHours(completedSummary.week)}课时</span>
@@ -1910,6 +1849,7 @@ export default function App() {
                   <button type="button" onClick={() => { setStatisticsNow(new Date()); setIsReportsOpen(true); }} className="inline-flex items-center gap-1 px-2 py-1 text-xs bg-indigo-50 text-indigo-600 border border-indigo-200 rounded-lg hover:bg-indigo-100"><BarChart3 size={14} />统计报告</button>
                   <button type="button" onClick={() => openTimeZoneConverter()} className="inline-flex items-center gap-1 px-2 py-1 text-xs bg-sky-50 text-sky-700 border border-sky-200 rounded-lg hover:bg-sky-100"><Globe2 size={14} />时区换算</button>
                 </div>
+                {completedSummary.undatedCount > 0 && <p className="text-[10px] text-amber-700 mt-1">部分旧固定课缺少起始日期，历史统计采用保守口径；详见统计报告。</p>}
               </div>
             </div>
 
@@ -1922,7 +1862,10 @@ export default function App() {
                 </span>
                 <button onClick={() => { const d = new Date(viewWeekStart); d.setDate(d.getDate()+7); setViewWeekStart(d); }} className="p-1.5 rounded-md hover:bg-white shadow-sm transition-all text-slate-600"><ChevronRight size={20} /></button>
               </div>
-              
+              <button type="button" onClick={() => setViewWeekStart(getMonday(new Date()))} className="px-3 py-2 rounded-lg border border-slate-200 bg-white text-xs font-bold text-slate-600">回到本周</button>
+              <button type="button" onClick={() => setScheduleView(value => value === 'week' ? 'list' : 'week')} className="px-3 py-2 rounded-lg border border-indigo-100 bg-indigo-50 text-xs font-bold text-indigo-600">{scheduleView === 'week' ? '列表视图' : '周视图'}</button>
+              <button disabled={!canEdit || syncing} onClick={() => { setHideEmptyOverlay(true); openModal(); }} className="bg-indigo-600 text-white px-4 py-2.5 rounded-lg text-sm font-black shadow-sm hover:bg-indigo-700 disabled:opacity-40 flex items-center gap-1"><Plus size={17} />新增排课</button>
+              <details className="relative"><summary className="cursor-pointer list-none px-3 py-2.5 rounded-lg bg-white border border-slate-200 text-xs font-bold text-slate-600">更多操作 <ChevronDown size={12} className="inline" /></summary><div className="absolute right-0 top-full mt-2 z-[100] w-[min(340px,calc(100vw-32px))] bg-white border border-slate-200 rounded-xl shadow-xl p-3 flex flex-wrap gap-2">
               <button onClick={toggleFullscreen} className="px-3 py-2.5 bg-white text-slate-600 border border-slate-200 rounded-lg text-sm font-bold shadow-sm hover:bg-slate-50 transition-all" title="全屏显示网页">
                 <Maximize2 size={16} />
               </button>
@@ -1941,7 +1884,7 @@ export default function App() {
                 <Sparkles size={16} className="text-purple-500" /> 智能顾问
               </button>
 
-              <button onClick={handleUndo} disabled={undoStack.length === 0} className={`px-3 py-2.5 rounded-lg text-sm font-black shadow-sm transition-all flex items-center border ${undoStack.length > 0 ? 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50' : 'bg-slate-50 text-slate-300 border-slate-100 cursor-not-allowed'}`} title="撤销操作">
+              <button onClick={handleUndo} disabled={undoStack.length === 0 || syncing || !canEdit} className={`px-3 py-2.5 rounded-lg text-sm font-black shadow-sm transition-all flex items-center border ${undoStack.length > 0 ? 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50' : 'bg-slate-50 text-slate-300 border-slate-100 cursor-not-allowed'}`} title="撤销操作">
                 <Undo size={16} />
               </button>
               <button onClick={handleDownload} disabled={isDownloading} className="px-3 py-2.5 bg-white text-slate-600 border border-slate-200 rounded-lg text-sm font-bold shadow-sm hover:bg-slate-50 transition-all" title="下载图片">
@@ -1951,38 +1894,37 @@ export default function App() {
                 <FileSpreadsheet size={16}/> 导出财务
               </button>
               <div className="w-[1px] h-6 bg-slate-200 mx-1"></div> 
-              <button onClick={() => { setHideEmptyOverlay(false); openModal(); }} className="bg-indigo-600 text-white px-5 py-2.5 rounded-lg text-[14px] font-black shadow-lg hover:bg-indigo-700 transition-all flex items-center gap-1">
-                <Plus size={18} /> 新增排课
-              </button>
               {isStandalone && (
-                <button onClick={() => signOut(auth)} className="px-3 py-2.5 bg-red-50 text-red-600 border border-red-100 rounded-lg text-sm font-black shadow-sm hover:bg-red-100 transition-all flex items-center gap-1 ml-1" title="退出登录">
+                <button disabled={syncing || isSavingTemplate} onClick={() => { if (!saveInFlightRef.current) signOut(auth); }} className="px-3 py-2.5 bg-red-50 text-red-600 border border-red-100 rounded-lg text-sm font-black shadow-sm hover:bg-red-100 transition-all flex items-center gap-1 ml-1 disabled:opacity-40" title="退出登录">
                   <LogOut size={16} />
                 </button>
               )}
+              </div></details>
             </div>
           </div>
 
-          <div className="bg-slate-50/80 backdrop-blur-md px-6 py-2.5 border-b border-slate-200 flex justify-between items-center text-[12px]">
-            <div className="text-slate-500 font-bold flex items-center gap-2 tracking-wide">
-              <Settings2 size={14}/> 系统数据管理中心
-            </div>
+          <details className="bg-slate-50/80 px-4 sm:px-6 py-2.5 border-b border-slate-200 text-[12px]">
+            <summary className="text-slate-500 font-bold cursor-pointer list-none tracking-wide"><Settings2 size={14} className="inline mr-1" />设置与备份 <ChevronDown size={12} className="inline ml-1" /></summary>
             
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2 mt-3">
               <button onClick={() => { setBackupText(JSON.stringify(coursesRefLatest.current, null, 2)); setBackupStatus(""); setIsBackupModalOpen(true); }} className="px-3 py-1.5 bg-white text-slate-600 border border-slate-200 rounded-md font-bold shadow-sm hover:bg-slate-50 transition-all flex items-center gap-1">
                 <Database size={14} /> 手动备份代码
               </button>
-              <button onClick={restoreLatestSchedule} className="px-3 py-1.5 bg-white text-indigo-600 border border-indigo-100 rounded-md font-bold shadow-sm hover:bg-indigo-50 transition-all flex items-center gap-1">
+              <button disabled={syncing || !canEdit} onClick={() => restoreLatestSchedule()} className="px-3 py-1.5 bg-white text-indigo-600 border border-indigo-100 rounded-md font-bold shadow-sm hover:bg-indigo-50 transition-all flex items-center gap-1 disabled:opacity-40">
                 <RefreshCw size={14} /> 从云端恢复备份
               </button>
-              <button onClick={handleUpdateTemplate} disabled={!!isSavingTemplate || courses.length === 0} className={`px-4 py-1.5 rounded-md font-bold shadow-sm transition-all flex items-center gap-1 border ${courses.length > 0 ? 'bg-emerald-50 text-emerald-600 border-emerald-200 hover:bg-emerald-100' : 'bg-slate-50 text-slate-300 border-slate-100 cursor-not-allowed'}`}>
+              <button disabled={syncing || !canEdit} onClick={() => restoreLatestSchedule('pre_restore_backup')} className="px-3 py-1.5 bg-white border border-slate-200 rounded-md font-bold disabled:opacity-40">恢复前副本</button>
+              <button onClick={handleUpdateTemplate} disabled={!!isSavingTemplate || syncing || !canEdit} className={`px-4 py-1.5 rounded-md font-bold shadow-sm transition-all flex items-center gap-1 border bg-emerald-50 text-emerald-600 border-emerald-200 disabled:opacity-40`}>
                 {isSavingTemplate === 'saving' ? <><RefreshCw size={14} className="animate-spin" /> 保存中</> : 
-                 isSavingTemplate === 'success' ? <><Cloud size={14} /> 已成功覆盖备份</> : 
-                 <><Cloud size={14} /> 保存当前为初始数据</>}
+                 isSavingTemplate === 'success' ? <><Cloud size={14} /> 云端备份已保存</> :
+                 <><Cloud size={14} /> 保存云端备份</>}
               </button>
             </div>
-          </div>
+          </details>
         </header>
       )}
+
+      {(loadError || restoreError || dataState === 'cached') && <div role="alert" className={`shrink-0 px-4 py-3 text-xs flex flex-wrap items-center gap-2 ${loadError || restoreError ? 'bg-red-50 text-red-700' : 'bg-amber-50 text-amber-800'}`}><span className="flex-1">{loadError || restoreError || '当前为离线缓存。编辑保存需等待网络恢复；未收到服务器确认前不会显示已同步。'}</span>{loadError && <button disabled={syncing} onClick={() => { setDataState('loading'); setLoadError(''); setLoadAttempt(value => value + 1); }} className="underline font-bold">重试读取</button>}{restoreError && <button onClick={() => setRestoreError('')} className="font-bold underline">知道了</button>}</div>}
 
       {isReportsOpen && <MonthlyReports courses={statisticsCourses} collectLessons={collectCompletedLessons} now={statisticsNow} onClose={closeReports} />}
       {zoneConverter && <TimeZoneConverter initial={zoneConverter} onClose={closeZoneConverter} onUse={applyConvertedTime} />}
@@ -2035,15 +1977,15 @@ export default function App() {
         </div>
       )}
 
-      <div ref={scheduleViewportRef} className={`flex-1 min-h-0 overflow-auto relative transition-colors duration-300 ${isViewingCurrentWeek ? 'bg-indigo-50/80' : 'bg-slate-100/70'} ${isZenMode || isCssFullscreen ? 'p-0' : 'p-6'}`}>
+      <div ref={scheduleViewportRef} className={`flex-1 min-h-0 overflow-auto relative z-0 transition-colors duration-300 ${isViewingCurrentWeek ? 'bg-indigo-50/80' : 'bg-slate-100/70'} ${isZenMode || isCssFullscreen ? 'p-0' : 'p-3 sm:p-6'}`}>
         
-        {courses.length === 0 && !syncing && !hideEmptyOverlay && (
+        {courses.length === 0 && dataState === 'ready' && !syncing && !hideEmptyOverlay && (
           <div className="absolute inset-0 z-[100] flex items-center justify-center bg-slate-900/60 backdrop-blur-md p-4 animate-in fade-in">
             <div className="bg-white p-8 rounded-[32px] shadow-2xl text-center border border-slate-100 max-w-md w-full flex flex-col items-center">
               <Database size={64} className="text-indigo-500 mb-6" />
-              <h2 className="text-2xl font-black text-slate-800 mb-3">初始化您的课表</h2>
+              <h2 className="text-2xl font-black text-slate-800 mb-3">你的课表还是空的</h2>
               <p className="text-sm font-medium text-slate-500 mb-8 leading-relaxed">
-                系统检测到当前课表为空。<br/>请选择您需要的初始化或重置方式：
+                空课表会保持为空，不会自动载入数据。<br/>可以直接新增，也可以明确选择恢复或示例：
               </p>
 
               <div className="w-full flex flex-col gap-3">
@@ -2054,7 +1996,7 @@ export default function App() {
                   <Calendar size={18} /> 2. 初始化数据 (固定排课)
                 </button>
                 <button onClick={() => setHideEmptyOverlay(true)} className="w-full py-4 bg-slate-100 text-slate-600 font-black rounded-2xl hover:bg-slate-200 transition-all flex items-center justify-center gap-2">
-                  <Plus size={18} /> 3. 从头手动添加 (空白课表)
+                  <Plus size={18} /> 从空白开始新增课程
                 </button>
               </div>
               
@@ -2065,7 +2007,13 @@ export default function App() {
           </div>
         )}
         
-        <div ref={scheduleRef} style={{ width: scheduleWidth, zoom: scheduleZoom / 100 }} onContextMenu={e => e.preventDefault()} className={`mx-auto bg-white flex flex-col relative border transition-colors ${isViewingCurrentWeek ? 'shadow-xl shadow-indigo-200/50 border-indigo-300 ring-4 ring-indigo-100' : 'shadow-sm border-slate-200'}`}>
+        {scheduleView === 'list' ? <div ref={scheduleRef} className="max-w-3xl mx-auto space-y-3">
+          {!visibleCourses.length && <p className="text-center text-slate-500 p-8 bg-white rounded-xl">本周暂无排课</p>}
+          {DAYS.map((day, colIndex) => {
+            const rows = visibleCourses.filter(course => course.colIndex === colIndex).sort((a, b) => a.startTime.localeCompare(b.startTime));
+            return rows.length > 0 && <section key={day} className="bg-white border border-slate-200 rounded-2xl overflow-hidden"><h2 className="px-4 py-3 bg-slate-50 text-sm font-black text-slate-600">{occurrenceDate(viewWeekId, colIndex)} {day}</h2><div className="divide-y divide-slate-100">{rows.map(course => <div key={course.id} className="flex items-center gap-3 px-4 py-3"><button disabled={!canEdit || syncing} onClick={() => openModal(course)} className="flex-1 min-w-0 text-left"><span className="block text-xs text-indigo-600 font-bold">{course.startTime}—{course.endTime}</span><span className="block font-black text-slate-800 mt-1 truncate">{course.title}</span><span className="block text-xs text-slate-500 mt-1">{['A', 'B', 'P'].includes(course.category) ? `${course.category}类` : '未分类'} · ¥{getCourseTotalValue(course, new Date(viewWeekStart.getFullYear(), viewWeekStart.getMonth(), viewWeekStart.getDate() + colIndex))}{course.notes ? ` · ${course.notes}` : ''}</span>{courseZonePreviews.get(course.id) && <span className="block text-xs text-indigo-500 mt-1">学员当地：{courseZonePreviews.get(course.id).start.date} {courseZonePreviews.get(course.id).start.time}</span>}</button><button disabled={!canEdit || syncing} onClick={() => performDelete(course.id)} aria-label={`删除课程${course.title}`} className="w-10 h-10 shrink-0 rounded-xl border border-slate-100 text-slate-400 hover:bg-red-50 hover:text-red-500 flex justify-center items-center"><X size={16} /></button></div>)}</div></section>;
+          })}
+        </div> : <div ref={scheduleRef} style={{ width: scheduleWidth, zoom: scheduleZoom / 100 }} onContextMenu={e => e.preventDefault()} className={`mx-auto bg-white flex flex-col relative border transition-colors ${isViewingCurrentWeek ? 'shadow-xl shadow-indigo-200/50 border-indigo-300 ring-4 ring-indigo-100' : 'shadow-sm border-slate-200'}`}>
           {isViewingCurrentWeek && (
             <div className="bg-gradient-to-r from-indigo-600 to-violet-500 text-white text-center py-1.5 text-[11px] font-black tracking-[0.3em] sticky top-0 z-[45]">
               当前周课表
@@ -2110,7 +2058,7 @@ export default function App() {
                         const rect = e.currentTarget.getBoundingClientRect();
                         const scale = rect.height / e.currentTarget.offsetHeight;
                         const y = (e.clientY - rect.top) / scale;
-                        const clickMins = getScheduleStartMinutes(y, { startHour: START_HOUR, endHour: END_HOUR, pixelsPerHour: PIXELS_PER_HOUR });
+                        const clickMins = getScheduleStartMinutes(y, { startHour: START_HOUR, endHour: END_HOUR + 1, pixelsPerHour: PIXELS_PER_HOUR });
                         openModal(null, colIdx, minutesToTime(clickMins));
                       }
                     }}>
@@ -2121,7 +2069,7 @@ export default function App() {
                       const course = group[activeIdx];
                       if (!course) return null;
                       
-                      const theme = TAGS[course.tag || 'P']?.theme || TAGS['P'].theme;
+                      const theme = (TAGS[course.tag] || TAGS.unclassified).theme;
                       const hasOverlap = group.length > 1;
                       const startPx = ((course.startM - START_HOUR * 60) / 60) * PIXELS_PER_HOUR;
                       const heightPx = ((course.endM - course.startM) / 60) * PIXELS_PER_HOUR;
@@ -2131,7 +2079,10 @@ export default function App() {
                       const zonePreview = courseZonePreviews.get(course.id);
 
                       return (
-                        <div key={course.id} 
+                        <div key={course.id} role="button" tabIndex={canEdit ? 0 : -1} aria-label={`编辑课程${course.title} ${course.startTime}—${course.endTime}`}
+                          onKeyDown={event => { if (event.target === event.currentTarget && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); openModal(course); } }}
+                          onPointerDown={event => { if (event.pointerType === 'touch') touchStartRef.current = { id: course.id, x: event.clientX, y: event.clientY, at: event.timeStamp }; }}
+                          onPointerUp={event => { const start = touchStartRef.current; if (event.pointerType === 'touch' && start?.id === course.id) { touchStartRef.current.at = event.timeStamp; if (!event.target.closest('button') && Math.abs(event.clientX - start.x) < 8 && Math.abs(event.clientY - start.y) < 8) openModal(course); } }}
                           onMouseDown={(e) => handleCourseMouseDown(e, course)}
                           title={`${displayInfo.title} · ${course.startTime}—${course.endTime}${finalNotes ? ` · ${finalNotes}` : ''}`}
                           className={`schedule-course-card absolute rounded-2xl cursor-grab active:cursor-grabbing transition-all duration-300 hover:scale-[1.01] flex flex-col shadow-sm group/card ${isCompact ? 'p-1 gap-0.5' : 'p-2 gap-0.5'}
@@ -2141,12 +2092,12 @@ export default function App() {
                           style={{ top: `${startPx + 2}px`, height: `${heightPx - 4}px`, zIndex: 20, left: '4px', right: '4px' }}>
                           
                           <div className="flex items-center gap-1 shrink-0 min-w-0">
-                            <span className={`shrink-0 flex items-center justify-center rounded-full font-black text-white ${isCompact ? 'w-2.5 h-2.5 text-[6px]' : 'w-3.5 h-3.5 text-[8px]'} ${TAGS[course.tag || 'P']?.badge.split(' ')[0]}`}>{String(course.tag)}</span>
+                            <span className={`shrink-0 flex items-center justify-center rounded-full font-black text-white ${isCompact ? 'w-2.5 h-2.5 text-[6px]' : 'w-3.5 h-3.5 text-[8px]'} ${(TAGS[course.tag] || TAGS.unclassified).badge.split(' ')[0]}`}>{String(course.tag)}</span>
                             <span className={`min-w-0 whitespace-nowrap font-bold text-slate-500 tracking-tight ${isCompact ? 'text-[7px] leading-[10px]' : 'text-[10px] leading-[14px]'}`}>{course.startTime}—{course.endTime}</span>
                             {(!course.isFixed || course.isBiweekly) && (!isCompact || !hasOverlap) && <span className="ml-auto shrink-0 text-[7px] leading-[10px] text-slate-500 bg-white/80 rounded px-0.5 group-hover/card:opacity-0">{course.isBiweekly ? '隔周' : '临时'}</span>}
                             {isCompact && hasOverlap && <button onClick={e => { e.stopPropagation(); setOverlapState(prev => ({ ...prev, [stateKey]: (activeIdx + 1) % group.length })); }} className="ml-auto shrink-0 flex items-center gap-0.5 rounded bg-white/80 text-[7px] leading-[10px] font-bold"><Layers size={7} />{activeIdx + 1}/{group.length}</button>}
                             {isCompact && zonePreview && <CourseTimeZoneBadge compact preview={zonePreview} zone={course.studentTimeZone} notes={finalNotes} onClick={() => openCourseTimeZone(course, zonePreview)} />}
-                            <button aria-label={`删除课程${course.title}`} onClick={e => { e.stopPropagation(); performDelete(course.id); }} className="absolute top-1 right-1 p-0.5 rounded bg-white opacity-0 group-hover/card:opacity-100 focus:opacity-100 text-slate-400 hover:text-red-500"><X size={isCompact ? 10 : 12} /></button>
+                            <button disabled={syncing || !canEdit} aria-label={`删除课程${course.title}`} onClick={e => { e.stopPropagation(); performDelete(course.id); }} className="hidden sm:block absolute top-1 right-1 p-0.5 rounded bg-white opacity-0 pointer-events-none group-hover/card:opacity-100 group-hover/card:pointer-events-auto focus:opacity-100 focus:pointer-events-auto text-slate-400 hover:text-red-500"><X size={isCompact ? 10 : 12} /></button>
                           </div>
                           <div className={`flex items-center gap-1 shrink-0 min-w-0 ${isCompact ? 'mt-auto' : ''}`}>
                             <div className={`schedule-course-title min-w-0 flex-1 truncate font-black pointer-events-none text-slate-900 ${isCompact ? 'text-[10px] leading-[12px]' : 'text-[14px] leading-[18px]'}`}>{String(displayInfo.title)}</div>
@@ -2165,15 +2116,15 @@ export default function App() {
               })}
             </div>
           </div>
-        </div>
+        </div>}
       </div>
 
       {dragInfo && (
         <div 
           className={`fixed pointer-events-none z-[100] p-3 rounded-2xl shadow-2xl opacity-90 border-2 border-dashed
-            ${TAGS[dragInfo.course.tag || 'P']?.theme.bg} 
-            ${TAGS[dragInfo.course.tag || 'P']?.theme.text} 
-            ${TAGS[dragInfo.course.tag || 'P']?.theme.border}
+            ${(TAGS[dragInfo.course.tag] || TAGS.unclassified).theme.bg}
+            ${(TAGS[dragInfo.course.tag] || TAGS.unclassified).theme.text}
+            ${(TAGS[dragInfo.course.tag] || TAGS.unclassified).theme.border}
           `}
           style={{ left: dragInfo.currX - dragInfo.offsetX, top: dragInfo.currY - dragInfo.offsetY, width: dragInfo.width, height: dragInfo.height, padding: 12 * dragInfo.scale }}
         >
@@ -2251,13 +2202,14 @@ export default function App() {
 
       {isModalOpen && (
         <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm flex items-center justify-center z-[50] p-4 animate-in fade-in">
-          <div className="bg-white rounded-[32px] shadow-2xl w-full max-w-2xl border border-slate-100 font-sans flex flex-col max-h-[90vh]">
+          <div ref={courseDialogRef} role="dialog" aria-modal="true" aria-labelledby="course-dialog-title" className="bg-white rounded-[24px] sm:rounded-[32px] shadow-2xl w-full max-w-2xl border border-slate-100 font-sans flex flex-col max-h-[92dvh]">
             <div className="flex items-center justify-between px-8 py-5 border-b border-slate-100 bg-slate-50/50 shrink-0">
-              <h2 className="text-2xl font-black text-slate-800 font-sans tracking-tight">{editingCourseId ? '修改课程' : '添加课程'}</h2>
-              <button onClick={() => setIsModalOpen(false)} className="p-2 hover:bg-slate-200 rounded-2xl text-slate-400 transition-all"><X size={20} /></button>
+              <h2 id="course-dialog-title" className="text-xl sm:text-2xl font-black text-slate-800 font-sans tracking-tight">{editingCourseId ? '修改课程' : '添加课程'}</h2>
+              <button ref={courseCloseRef} disabled={syncing} aria-label="关闭课程编辑" onClick={closeCourseDialog} className="p-2 hover:bg-slate-200 rounded-2xl text-slate-400 transition-all"><X size={20} /></button>
             </div>
             
-            <div className="p-8 space-y-6 text-[15px] overflow-y-auto">
+            <fieldset disabled={syncing} className="min-h-0 p-4 sm:p-8 space-y-5 text-[15px] overflow-y-auto">
+              {restoreError && <p role="alert" className="text-xs text-red-700 bg-red-50 border border-red-100 rounded-xl p-3">{restoreError}</p>}
               <div className="space-y-2">
                 <div className="flex justify-between items-center text-[15px] font-black text-slate-700">
                   <span>课程名称</span>
@@ -2274,7 +2226,7 @@ export default function App() {
                     onFocus={() => setIsTitleDropdownOpen(true)}
                     onBlur={() => setTimeout(() => setIsTitleDropdownOpen(false), 200)}
                     onChange={e => {
-                      setFormData({...formData, title: e.target.value});
+                      setFormData({ ...formData, title: e.target.value, ...(!editingCourseId ? { studentTimeZone: studentTimeZoneDefault(courses, e.target.value), studentTimeZoneChanged: false } : {}) });
                       setIsTitleDropdownOpen(true);
                     }} 
                     className="w-full h-[52px] border-2 border-slate-100 rounded-2xl px-4 text-[15px] leading-none outline-none focus:border-indigo-500 font-bold transition-all bg-white" 
@@ -2295,13 +2247,14 @@ export default function App() {
                                   title: name,
                                   value: existingCourse.value,
                                   price: existingCourse.value,
-                                  tag: existingCourse.tag || 'P',
-                                  category: existingCourse.tag || 'P',
+                                  tag: existingCourse.tag ?? 'P',
+                                  category: existingCourse.category ?? existingCourse.tag ?? '',
                                   recurrence: existingCourse.isBiweekly ? 'biweekly' : (existingCourse.isFixed ? 'weekly' : 'temp'),
                                   lessonTrackingEnabled: existingCourse.lessonTrackingEnabled || false,
                                   lessonCycleStarts: existingCourse.lessonCycleStarts || [],
                                   lessonTrackingAnchors: existingCourse.lessonTrackingAnchors || [],
-                                  studentTimeZone: existingCourse.studentTimeZone || '',
+                                  studentTimeZone: studentTimeZoneDefault(courses, name),
+                                  studentTimeZoneChanged: false,
                                 });
                               } else {
                                 setFormData({...formData, title: name});
@@ -2393,6 +2346,7 @@ export default function App() {
                       className="w-full h-12 border-2 border-slate-100 rounded-2xl pl-16 pr-12 text-[14px] font-black outline-none focus:border-indigo-500 focus:bg-white bg-slate-50/40 transition-all shadow-sm appearance-none"
                     >
                       {DURATION_OPTIONS.map(o=><option key={o.value} value={o.value}>{String(o.label)}</option>)}
+                      {!DURATION_OPTIONS.some(option => option.value === Number(formData.duration)) && <option value={formData.duration}>{formData.duration}分钟（原课程）</option>}
                     </select>
                     <div className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-500 pointer-events-none"><ChevronDown size={18} /></div>
                   </div>
@@ -2400,35 +2354,26 @@ export default function App() {
               </div>
               
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-5 font-bold">
+                <div className="space-y-2"><TimePicker large label="开始时间（北京时间）" value={formData.startTime} onChange={startTime => setFormData(current => ({ ...current, startTime }))} /><p className="text-[10px] text-slate-400 font-bold">结束时间：{minutesToTime(timeToMinutes(formData.startTime) + Number(formData.duration))}{timeToMinutes(formData.startTime) + Number(formData.duration) >= 1440 ? '（次日）' : ''}</p></div>
                 <div className="space-y-2">
-                  <label className="block text-[15px] font-black text-slate-700">开始时间</label>
-                  <div className="relative group">
-                    <div className="absolute left-3 top-1/2 -translate-y-1/2 w-9 h-9 rounded-xl bg-indigo-50 text-indigo-600 flex items-center justify-center shadow-sm pointer-events-none group-focus-within:bg-indigo-100 transition-all"><Clock size={18} /></div>
-                    <input
-                      type="time"
-                      value={formData.startTime}
-                      onChange={e => setFormData({...formData, startTime: e.target.value})}
-                      className="w-full h-12 border-2 border-slate-100 rounded-2xl pl-14 pr-4 text-[14px] font-black outline-none focus:border-indigo-500 focus:bg-white bg-slate-50/40 transition-all shadow-sm"
-                    />
-                  </div>
-                </div>
-                <div className="space-y-2">
-                  <label className="block text-[15px] font-black text-slate-700">所在星期</label>
+                  <label htmlFor="course-calendar-date" className="block text-[15px] font-black text-slate-700">上课日期 <span className="text-xs font-normal text-indigo-500">{DAYS[formData.colIndex]}</span></label>
                   <div className="relative group">
                     <div className="absolute left-3 top-1/2 -translate-y-1/2 w-9 h-9 rounded-xl bg-indigo-50 text-indigo-600 flex items-center justify-center shadow-sm pointer-events-none group-focus-within:bg-indigo-100 transition-all z-10"><Calendar size={18} /></div>
-                    <select
-                      value={formData.colIndex}
-                      onChange={e => setFormData({...formData, colIndex: Number(e.target.value)})}
-                      className="w-full h-12 border-2 border-slate-100 rounded-2xl pl-16 pr-12 text-[14px] font-black outline-none focus:border-indigo-500 focus:bg-white bg-slate-50/40 transition-all shadow-sm appearance-none"
-                    >
-                      {DAYS.map((d,i)=><option key={i} value={i}>{d}</option>)}
-                    </select>
-                    <div className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-500 pointer-events-none"><ChevronDown size={18} /></div>
+                    <input id="course-calendar-date" type="date" value={occurrenceDate(viewWeekId, Number(formData.colIndex))} min={editingCourseId ? viewWeekId : '1900-01-01'} max={editingCourseId ? occurrenceDate(viewWeekId, 6) : '9998-12-31'} onChange={event => {
+                      const selected = courseDateSelection(event.target.value);
+                      if (!selected) { setCourseDateError('请选择有效的上课日期'); return; }
+                      if (editingCourseId && selected.weekId !== viewWeekId) { setCourseDateError('修改已有课程时请选择当前课表周内的日期，跨周请新增或复制排课。'); return; }
+                      setCourseDateError('');
+                      if (selected.weekId !== viewWeekId) { const [year, month, day] = selected.weekId.split('-').map(Number); setViewWeekStart(new Date(year, month - 1, day)); }
+                      setFormData(current => ({ ...current, colIndex: selected.colIndex, weekday: selected.colIndex }));
+                    }} className="w-full h-12 border-2 border-slate-100 rounded-2xl pl-16 pr-3 text-[14px] font-black outline-none focus:border-indigo-500 bg-slate-50/40" />
                   </div>
+                  <p className="text-[10px] text-slate-400 font-bold">{editingCourseId ? '修改限定在当前周；更早的固定排课保留历史。' : '选择日期后自动同步课表周与星期。'}</p>
                 </div>
               </div>
+              {courseDateError && <p role="alert" className="text-xs text-amber-700 bg-amber-50 p-3 rounded-xl">{courseDateError}</p>}
 
-              <CourseTimeZonePanel weekId={viewWeekId} formData={formData} onChange={studentTimeZone => setFormData(current => ({ ...current, studentTimeZone }))} onConvert={initial => openTimeZoneConverter({ ...initial, studentTimeZone: formData.studentTimeZone || '', context: 'editor' })} />
+              <CourseTimeZonePanel weekId={viewWeekId} formData={formData} onChange={studentTimeZone => setFormData(current => ({ ...current, studentTimeZone, studentTimeZoneChanged: true }))} onConvert={initial => openTimeZoneConverter({ ...initial, studentTimeZone: formData.studentTimeZone || '', context: 'editor' })} />
               <div className="space-y-3 text-[15px] font-black text-slate-700">标签分类
                 <div className="flex gap-4">{['A', 'B', 'P'].map(t => (
                   <label key={t} className="flex items-center gap-2 cursor-pointer p-2 rounded-xl hover:bg-slate-50 transition-all border border-transparent hover:border-slate-100">
@@ -2487,18 +2432,18 @@ export default function App() {
                   maxLength={100}
                 />
               </div>
-            </div>
+            </fieldset>
             
-            <div className="px-8 py-6 border-t border-slate-100 bg-slate-50/50 flex justify-between gap-3 font-black shrink-0">
+            <div className="px-4 sm:px-8 py-4 border-t border-slate-100 bg-slate-50/50 flex flex-wrap justify-between gap-3 font-black shrink-0">
               {editingCourseId ? <div className="flex gap-2">
-                {courses.find(c=>c.id===editingCourseId)?.isFixed && <button onClick={() => performDelete(editingCourseId, false)} className="px-3 py-2.5 bg-white border border-orange-100 text-orange-600 rounded-2xl shadow-sm hover:bg-orange-50 transition-all text-[11px]">仅取消本周</button>}
-                <button onClick={() => performDelete(editingCourseId, true)} className="px-3 py-2.5 bg-white border border-red-100 text-red-600 rounded-2xl shadow-sm hover:bg-red-50 transition-all text-[11px]">
+                {courses.find(c=>c.id===editingCourseId)?.isFixed && <button disabled={syncing || !canEdit} onClick={() => performDelete(editingCourseId, false)} className="px-3 py-2.5 bg-white border border-orange-100 text-orange-600 rounded-2xl shadow-sm hover:bg-orange-50 transition-all text-[11px]">仅取消本周</button>}
+                <button disabled={syncing || !canEdit} onClick={() => performDelete(editingCourseId, true)} className="px-3 py-2.5 bg-white border border-red-100 text-red-600 rounded-2xl shadow-sm hover:bg-red-50 transition-all text-[11px]">
                   {courses.find(c=>c.id===editingCourseId)?.isFixed && courses.find(c=>c.id===editingCourseId)?.baseWeekId !== viewWeekId ? '从此周起结束 (保留历史)' : '彻底删除'}
                 </button>
               </div>: <div/>}
               <div className="flex gap-3">
-                {editingCourseId && <button onClick={() => handleSave(true)} className="px-5 py-2.5 bg-white border border-indigo-100 text-indigo-600 rounded-2xl shadow-sm hover:bg-indigo-50 flex items-center gap-1 transition-all text-[12px] font-sans"><Copy size={16}/> 复制给本周</button>}
-                <button onClick={() => handleSave(false)} className="px-8 py-2.5 bg-indigo-600 text-white rounded-2xl shadow-lg hover:bg-indigo-700 transition-all text-[13px]">保存</button>
+                {editingCourseId && <button disabled={syncing || !canEdit} onClick={() => handleSave(true)} className="px-5 py-2.5 bg-white border border-indigo-100 text-indigo-600 rounded-2xl shadow-sm hover:bg-indigo-50 flex items-center gap-1 transition-all text-[12px] font-sans"><Copy size={16}/> 复制给本周</button>}
+                <button disabled={syncing || !canEdit} onClick={() => handleSave(false)} className="px-8 py-2.5 bg-indigo-600 text-white rounded-2xl shadow-lg hover:bg-indigo-700 disabled:opacity-40 disabled:cursor-not-allowed transition-all text-[13px]">{syncing ? '正在保存…' : '保存'}</button>
               </div>
             </div>
           </div>

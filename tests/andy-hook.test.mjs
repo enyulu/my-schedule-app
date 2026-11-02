@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
-import { summarizeAndy } from '../src/andyCounter.js';
+import { summarizeAndy, createAndyBackfill } from '../src/andyCounter.js';
 
 // Execute the actual hook with a deterministic effect/state scheduler; replace
 // only React scheduling and the external store, not the hook's action logic.
@@ -15,7 +15,7 @@ const harness = () => {
     Date: class extends Date { constructor(...args) { super(...(args.length ? args : [clock])); } static now() { return clock; } },
     crypto: { randomUUID: () => `event-${++sequence}` },
     window: { addEventListener() {}, removeEventListener() {} },
-    setTimeout: () => 1, clearTimeout() {}, summarizeAndy,
+    setTimeout: () => 1, clearTimeout() {}, summarizeAndy, createAndyBackfill,
     useState: initial => {
       const index = cursor++;
       if (!slots[index]) slots[index] = { value: typeof initial === 'function' ? initial() : initial };
@@ -28,7 +28,7 @@ const harness = () => {
       if (!same(slots[index]?.deps, deps)) effects.push(() => { slots[index]?.cleanup?.(); slots[index] = { deps, cleanup: fn() }; });
     },
     createAndyStore: options => {
-      const store = { options, subscribe: fn => { store.emit = fn; fn({ rows: [], status: 'loading', error: '' }); return () => {}; }, add: async () => {}, undo: async id => { store.undone = id; } };
+      const store = { options, subscribe: fn => { store.emit = fn; fn({ rows: [], status: 'loading', error: '' }); return () => {}; }, add: async () => {}, addMany: async rows => { store.added = rows; }, undo: async id => { store.undone = id; } };
       stores.push(store); return store;
     },
   };
@@ -90,4 +90,30 @@ test('ID generation errors cannot leave the card permanently locked', async () =
   await h.flush().add();
   assert.equal(h.flush().pending, false);
   assert.match(h.flush().actionError, /unavailable/);
+});
+test('backfill retries retain date, quantity and event IDs, then refresh original month totals', async () => {
+  const h = harness(); h.ready(); let attempts = 0, original;
+  h.stores[0].addMany = async rows => { if (!attempts++) { original = rows; throw Error('offline'); } assert.deepEqual(rows, original); };
+  assert.equal(await h.flush().backfill('2026-10-31', 3), false);
+  assert.ok(h.flush().retry);
+  assert.equal(await h.flush().backfill('2026-10-30', 8), true);
+  assert.equal(h.flush().summary.byDay['2026-10-31'], 3);
+  assert.equal(h.flush().summary.byMonth['2026-10'], 3);
+  assert.equal(h.flush().celebration, null);
+});
+test('calendar undo targets the chosen historical record, never the latest unrelated attendance', async () => {
+  const h = harness(), base = new Date('2026-11-01T12:00:00').getTime();
+  h.ready([{ id: 'older', occurredAt: base - 86400000, voided: false }, { id: 'latest', occurredAt: base, voided: false }]);
+  await h.flush().undoEntry('older');
+  assert.equal(h.stores[0].undone, 'older');
+  assert.equal(h.flush().summary.total, 1);
+});
+test('a freshly confirmed backfill can be undone before the next server listener notification', async () => {
+  const h = harness(); h.ready();
+  await h.flush().backfill('2026-10-31', 2);
+  const entry = h.flush().rows[0];
+  assert.ok(entry);
+  await h.flush().undoEntry(entry.id);
+  assert.equal(h.stores[0].undone, entry.id);
+  assert.equal(h.flush().summary.total, 1);
 });

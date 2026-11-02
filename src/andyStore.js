@@ -22,22 +22,36 @@ export const createAndyStore = ({ db, appId, userId, isCurrentUser, sdk = firest
     }, error => emit({ status: 'error', error: `Andy记录无法读取：${error.message}` }));
     return () => { active = false; close(); };
   };
-  const add = async row => {
-    guard(); validateAndySession(row);
-    if (row.voided) throw Error('不能新增已撤销记录');
-    const target = sdk.doc(db, ...root, row.id);
+  const addMany = async rows => {
+    guard();
+    if (!Array.isArray(rows) || rows.length < 1 || rows.length > 50) throw Error('每次新增记录数量应为1至50堂');
+    const ids = new Set();
+    rows.forEach(row => {
+      validateAndySession(row);
+      if (row.voided) throw Error('不能新增已撤销记录');
+      if (ids.has(row.id)) throw Error('新增记录编号重复');
+      ids.add(row.id);
+    });
+    const targets = rows.map(row => sdk.doc(db, ...root, row.id));
     await sdk.runTransaction(db, async transaction => {
       guard();
-      const current = await transaction.get(target);
+      const existingRows = await Promise.all(targets.map(target => transaction.get(target)));
       guard();
-      if (current.exists()) {
-        const existing = validateAndySession({ ...current.data(), id: row.id });
-        if (existing.occurredAt !== row.occurredAt) throw Error('Andy记录编号冲突，请刷新后重试');
-        return; // Retrying an ambiguous acknowledgement must never add twice.
-      }
-      transaction.set(target, { id: row.id, occurredAt: row.occurredAt, voided: false, createdAt: Date.now() });
+      existingRows.forEach((current, index) => {
+        const row = rows[index];
+        if (current.exists()) {
+          const existing = validateAndySession({ ...current.data(), id: row.id });
+          if (existing.occurredAt !== row.occurredAt) throw Error('Andy记录编号冲突，请刷新后重试');
+        }
+      });
+      existingRows.forEach((current, index) => {
+        if (current.exists()) return; // Never duplicate or resurrect a retried attendance.
+        const row = rows[index];
+        transaction.set(targets[index], { id: row.id, occurredAt: row.occurredAt, voided: false, createdAt: Date.now(), ...(row.entryKind === 'backfill' ? { entryKind: 'backfill', recordedAt: row.recordedAt } : {}) });
+      });
     });
   };
+  const add = row => addMany([row]);
   const undo = async id => {
     guard();
     if (!/^[\w-]{1,100}$/.test(id)) throw Error('撤销记录无效');
@@ -52,5 +66,5 @@ export const createAndyStore = ({ db, appId, userId, isCurrentUser, sdk = firest
       transaction.set(target, { ...row, voided: true, voidedAt: Date.now() });
     });
   };
-  return { subscribe, add, undo };
+  return { subscribe, add, addMany, undo };
 };

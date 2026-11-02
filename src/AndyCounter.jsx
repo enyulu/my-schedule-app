@@ -1,6 +1,7 @@
-import { useEffect, useMemo, useState } from 'react';
-import { Gem, Plus, Undo2, Sparkles, LoaderCircle } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { CalendarDays, Gem, Plus, Undo2, Sparkles, LoaderCircle } from 'lucide-react';
 import { summarizeAndy } from './andyCounter.js';
+import AndyCalendar from './AndyCalendar.jsx';
 import './andyCounter.css';
 
 function Jewel({ burst = false }) {
@@ -16,6 +17,8 @@ function Jewel({ burst = false }) {
 }
 
 export default function AndyCounter({ counter, side = false }) {
+  const [calendarOpen, setCalendarOpen] = useState(false);
+  const closeCalendar = useCallback(() => setCalendarOpen(false), []);
   const [expiredId, setExpiredId] = useState(null);
   const burst = counter.celebration && counter.celebration.id !== expiredId ? counter.celebration.id : null;
   useEffect(() => {
@@ -25,7 +28,7 @@ export default function AndyCounter({ counter, side = false }) {
   }, [counter.celebration]);
   const ready = counter.status === 'ready', hasData = ready || counter.status === 'cached';
   return <aside aria-label="Andy独立上课计数" className={`andy-card ${side ? 'andy-card--side' : ''}`}>
-    <div className="andy-card-top"><span><Gem size={15} />独立上课记录</span><span className="andy-card-tag">仅计次数</span></div>
+    <div className="andy-card-top"><span><Gem size={15} />独立上课记录</span><button type="button" onClick={() => setCalendarOpen(true)} className="andy-card-tag flex items-center gap-1 hover:text-violet-700" aria-label="查看Andy上课记录"><CalendarDays size={12} />记录</button></div>
     <button type="button" aria-label={counter.retry ? '重试Andy本次上课记录' : 'Andy课时增加一次'} disabled={!ready || counter.pending || !!counter.undoRetry} onClick={counter.add} className="andy-add">
       <span className="andy-title">Andy课时 <Sparkles size={17} /></span>
       <span className="andy-count" aria-live="polite">{hasData ? counter.summary.weekCount : '—'}<small>次<span>本周已上</span></small></span>
@@ -37,6 +40,7 @@ export default function AndyCounter({ counter, side = false }) {
     {counter.summary.latest && <p className="andy-latest">最近记录 · {new Date(counter.summary.latest.occurredAt).toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false })}</p>}
     {(counter.error || counter.actionError) && <p role="alert" className="andy-error">{counter.error || counter.actionError}</p>}
     {counter.status === 'error' && <p className="andy-latest">请检查网络或权限后刷新，不会清空已有记录。</p>}
+    {calendarOpen && <AndyCalendar counter={counter} onClose={closeCalendar} />}
   </aside>;
 }
 

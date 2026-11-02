@@ -117,23 +117,34 @@ export const createCourseWriteBatch = ({ db, appId, userId, isCurrentUser, befor
       if (hasImpact && !await confirmImpact(plan)) throw Error('已取消操作，课程与课包均未修改');
       const now = Date.now();
       await sdk.runTransaction(db, async transaction => {
-        const manifestRef = ref('app_state', 'tuition_manifest'), manifestSnap = await transaction.get(manifestRef);
+        // Start independent reads together. Keep every read inside this transaction
+        // (and rebuild on retries), so faster saves retain conflict protection.
+        const manifestRef = ref('app_state', 'tuition_manifest');
+        const checkedBindings = new Set([...plan.bindingChanges.map(change => change.id), ...inheritances.map(row => row.fromId), ...relocations.map(row => row.fromId), ...(tuitionState.bindings || []).filter(row => touched.has(row.courseId)).map(row => row.courseId)]);
+        const bindingIds = [...checkedBindings];
+        const [manifestSnap, currentCourses, initialBindings, selectedAccounts] = await Promise.all([
+          transaction.get(manifestRef),
+          Promise.all(courseOps.map(op => transaction.get(op.target))),
+          Promise.all(bindingIds.map(id => transaction.get(ref('tuition_bindings', id)))),
+          Promise.all(plan.affectedAccountIds.map(id => transaction.get(ref('tuition_accounts', id)))),
+        ]);
         const manifest = manifestSnap.exists() ? manifestSnap.data() : { courseIds: [], version: 0 };
         if (manifest.courseIds?.some(id => touched.has(id) || inheritances.some(row => row.fromId === id) || relocations.some(row => row.fromId === id)) && tuitionState.status !== 'ready') throw Error('课包关联状态无法读取，请先恢复连接再修改这门课');
-        const currentCourses = await Promise.all(courseOps.map(op => transaction.get(op.target)));
         currentCourses.forEach((snapshot, index) => {
           const id = pathOf(courseOps[index].target).split('/').at(-1), previous = before.get(id);
           if (previous && !snapshot.exists() || !previous && snapshot.exists()) throw Error('课程记录已被修改，请刷新后重试');
           if (previous && canonical(normalizeCourse({ ...snapshot.data(), id })) !== canonical(normalizeCourse(previous))) throw Error('课程记录已被修改，请刷新后重试');
         });
-        const checkedBindings = new Set([...plan.bindingChanges.map(change => change.id), ...inheritances.map(row => row.fromId), ...relocations.map(row => row.fromId), ...[...(manifest.courseIds || [])].filter(id => touched.has(id))]);
-        const bindingIds = [...checkedBindings];
-        const currentBindings = await Promise.all(bindingIds.map(id => transaction.get(ref('tuition_bindings', id))));
+        // Another device may have linked a course since the local snapshots.
+        // Read server-discovered bindings rather than trusting a local fast path.
+        const discoveredIds = [...new Set(manifest.courseIds || [])].filter(id => touched.has(id) && !checkedBindings.has(id));
+        const discoveredBindings = discoveredIds.length ? await Promise.all(discoveredIds.map(id => transaction.get(ref('tuition_bindings', id)))) : [];
+        discoveredIds.forEach(id => { bindingIds.push(id); checkedBindings.add(id); });
+        const currentBindings = [...initialBindings, ...discoveredBindings];
         currentBindings.forEach((snapshot, index) => {
           const original = tuitionState.bindings?.find(binding => binding.courseId === bindingIds[index]);
           if ((snapshot.exists() ? snapshot.data().version : 0) !== (original?.version || 0)) throw Error('课包关联已被修改，请刷新后重试');
         });
-        const selectedAccounts = await Promise.all(plan.affectedAccountIds.map(id => transaction.get(ref('tuition_accounts', id))));
         selectedAccounts.forEach((snapshot, index) => {
           if (!snapshot.exists()) throw Error('关联的课包账户不存在');
           const expected = tuitionState.accounts.find(row => row.id === plan.affectedAccountIds[index]);

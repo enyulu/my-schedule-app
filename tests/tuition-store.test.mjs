@@ -103,3 +103,82 @@ test('course wrapper rejects concurrent schedule changes instead of overwriting 
   await assert.rejects(batch.commit(), /课程.*已被修改/);
   assert.equal(f.records.get(root + 'courses/c').startTime, '12:00');
 });
+
+// Each drain represents one server-read round; writes are still committed atomically.
+const measureCourseReads = async ({ linked = false, staleBinding = false, conflict = '', retry = false } = {}) => {
+  const f = fixture(), root = 'artifacts/stable-schedule-private-v999/users/A/';
+  const course = { id: 'c', title: 'Nina', category: 'A', startTime: '10:00', endTime: '11:00' };
+  const account = { ...accountChange.data, id: 'one', version: 1 };
+  const binding = { id: 'c', courseId: 'c', version: 1, segments: [{ fromKey: '2026-10-28|10:00', toKey: null, accountId: 'one' }] };
+  f.records.set(root + 'courses/c', course);
+  if (linked) {
+    f.records.set(root + 'app_state/tuition_manifest', { courseIds: ['c'], version: 1 });
+    f.records.set(root + 'tuition_bindings/c', binding);
+    f.records.set(root + 'tuition_accounts/one', account);
+    if (conflict === 'binding') f.records.set(root + 'tuition_bindings/c', { ...binding, version: 2 });
+    if (conflict === 'account') f.records.set(root + 'tuition_accounts/one', { ...account, version: 2 });
+  }
+  const queue = [], reads = [];
+  let rounds = 0;
+  const transaction = f.sdk.runTransaction;
+  const readTransaction = (db, fn) => transaction(db, tx => fn({ ...tx, get: path => new Promise(resolve => {
+    reads.push(path);
+    queue.push(() => resolve({ exists: () => f.records.has(path), data: () => f.records.get(path) }));
+  }) }));
+  f.sdk.runTransaction = async (db, fn) => {
+    if (retry) {
+      // Discard the first attempt's writes, as Firestore does after contention.
+      await readTransaction(db, tx => fn({ ...tx, set: () => {}, update: () => {}, delete: () => {} }));
+      f.records.set(root + 'tuition_bindings/c', { ...binding, version: 2 });
+    }
+    return readTransaction(db, fn);
+  };
+  const batch = createCourseWriteBatch({ db: {}, appId: 'stable-schedule-private-v999', userId: 'A', isCurrentUser: () => true, sdk: f.sdk, beforeCourses: [course], tuitionState: { status: 'ready', accounts: linked ? [account] : [], bindings: linked && !staleBinding ? [binding] : [] } });
+  batch.set(root + 'courses/c', { ...course, notes: 'updated' });
+  let done = false, error;
+  const saving = batch.commit().catch(reason => { error = reason; }).finally(() => { done = true; });
+  while (!done) {
+    await new Promise(resolve => setImmediate(resolve));
+    if (queue.length) { rounds++; queue.splice(0).forEach(resolve => resolve()); }
+  }
+  await saving;
+  return { rounds, reads, records: f.records, root, error };
+};
+
+test('ordinary course save completes its safety reads in one server round without package reads', async () => {
+  const result = await measureCourseReads();
+  assert.ifError(result.error);
+  assert.equal(result.rounds, 1);
+  assert.equal(result.reads.length, 2);
+  assert.equal(result.records.get(result.root + 'courses/c').notes, 'updated');
+});
+
+test('known linked course reads course, binding, account and manifest concurrently without duplicate reads', async () => {
+  const result = await measureCourseReads({ linked: true });
+  assert.ifError(result.error);
+  assert.equal(result.rounds, 1);
+  assert.equal(result.reads.length, 4);
+  assert.equal(result.records.get(result.root + 'courses/c').notes, 'updated');
+  assert.equal([...result.records.keys()].filter(path => path.includes('/tuition_audit/')).length, 1);
+});
+
+test('server-discovered binding still blocks a stale client without partially saving', async () => {
+  const result = await measureCourseReads({ linked: true, staleBinding: true });
+  assert.match(result.error?.message || '', /课包关联已被修改/);
+  assert.equal(result.records.get(result.root + 'courses/c').notes, undefined);
+});
+
+for (const conflict of ['binding', 'account']) {
+  test(`parallel reads preserve ${conflict} version conflicts and atomic failure`, async () => {
+    const result = await measureCourseReads({ linked: true, conflict });
+    assert.match(result.error?.message || '', /已被修改/);
+    assert.equal(result.records.get(result.root + 'courses/c').notes, undefined);
+    assert.equal([...result.records.keys()].some(path => path.includes('/tuition_audit/')), false);
+  });
+}
+
+test('transaction retries reread bindings instead of reusing the first attempt snapshots', async () => {
+  const result = await measureCourseReads({ linked: true, retry: true });
+  assert.match(result.error?.message || '', /课包关联已被修改/);
+  assert.equal(result.records.get(result.root + 'courses/c').notes, undefined);
+});

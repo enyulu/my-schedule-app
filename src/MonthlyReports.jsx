@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { BarChart3, ChevronLeft, ChevronRight, Download, X } from 'lucide-react';
 import { buildMonthlyReport, collectReportLessons, createMonthlyReportCsv, monthId, shiftMonth } from './monthlyReports.js';
+import { AndyStatistics } from './AndyCounter.jsx';
 
 const number = value => new Intl.NumberFormat('zh-CN', { maximumFractionDigits: 2 }).format(value);
 const money = value => value === null ? '—' : `¥${number(value)}`;
@@ -56,7 +57,7 @@ function RateChart({ months }) {
   </div>;
 }
 
-export default function MonthlyReports({ courses, collectLessons, now, onClose }) {
+export default function MonthlyReports({ courses, collectLessons, now, andy, onClose }) {
   const [month, setMonth] = useState(() => monthId(now));
   const [windowMonths, setWindowMonths] = useState(6);
   const [metric, setMetric] = useState('minutes');
@@ -119,6 +120,7 @@ export default function MonthlyReports({ courses, collectLessons, now, onClose }
           {cards.map(card => <div key={card.label} className="bg-white border border-slate-200 rounded-2xl p-4 min-w-0"><p className="text-xs font-bold text-slate-500">{card.label}</p><p className="text-xl sm:text-2xl font-black text-slate-800 mt-2 break-words">{card.value}</p><p className={`text-xs mt-2 ${card.change !== null && card.change < 0 ? 'text-amber-700' : 'text-teal-700'}`}>{card.change === null ? card.label === '授课学员' ? report.comparisonLabel : '上期为零或无数据，暂无变化率' : `${report.comparisonLabel} ${card.change >= 0 ? '+' : ''}${percent(card.change)}`}</p><p className="text-[11px] text-slate-400 mt-2 leading-relaxed">{card.note}</p></div>)}
         </div>
         {month === currentMonth && <div className="rounded-xl border border-indigo-200 bg-indigo-50 p-4 text-sm text-indigo-900 leading-relaxed"><strong>待完成排课预计课酬 {money(report.scheduled.fee)}</strong><span className="block sm:inline sm:ml-3 text-xs">{report.scheduled.count}次｜{hours(report.scheduled.minutes)}课时，包含进行中课程；与已完成课酬合计预计 {money(report.projectedFee)}。不保证实际上课或收款。</span></div>}
+        {andy && <AndyStatistics counter={andy} range={{ start: `${month}-01`, end: `${month}-31` }} months={report.months.map(row => row.month)} />}
         <Panel title="本月观察" description="由当前记录计算的变化提示，不对缺失历史作推断。"><ul className="space-y-2 text-sm text-slate-600">{report.insights.map((insight, index) => <li key={index} className="flex gap-2"><span className="text-indigo-400">•</span><span>{insight}</span></li>)}</ul></Panel>
         <div className="grid lg:grid-cols-2 gap-5">
           <Panel title="每月课酬趋势" description="仅已完成课程，单位：元；当前月为截至当前时间的累计值。"><FeeChart months={report.months} /></Panel>

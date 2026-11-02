@@ -4,6 +4,8 @@ import MonthlyReports from './MonthlyReports.jsx';
 import TuitionPackages from './TuitionPackages.jsx';
 import useTuitionPackages from './useTuitionPackages.js';
 import TuitionBinding from './TuitionBinding.jsx';
+import AndyCounter, { AndyStatistics } from './AndyCounter.jsx';
+import useAndyCounter from './useAndyCounter.js';
 import { createCourseWriteBatch } from './tuitionStore.js';
 import { bindingAccountAt, calculateTuition, collectTuitionOccurrences, tuitionHours, tuitionStartDate } from './tuitionPackages.js';
 import { filterKnownOccurrences } from './monthlyReports.js';
@@ -588,12 +590,14 @@ export default function App() {
   const [viewWeekStart, setViewWeekStart] = useState(currentRealMonday);
   const [user, setUser] = useState(null);
   const tuition = useTuitionPackages({ db, appId: FIXED_APP_ID, userId: user?.uid, courses, now: statisticsNow });
+  const andy = useAndyCounter({ db, appId: FIXED_APP_ID, userId: user?.uid, identityRef: activeUserIdRef });
   const [authInitialized, setAuthInitialized] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const canEdit = Boolean(user) && !loadError && (dataState === 'ready' || (dataState === 'cached' && courses.length > 0));
   const [overlapState, setOverlapState] = useState({});
   const [hideEmptyOverlay, setHideEmptyOverlay] = useState(false);
   const [scheduleView, setScheduleView] = useState('week');
+  const andyAtSide = (scheduleViewportWidth - (scheduleView === 'list' ? 768 : scheduleWidth * scheduleZoom / 100)) / 2 >= 296;
   const touchStartRef = useRef(null);
   
   const [isZenMode, setIsZenMode] = useState(false);
@@ -2006,7 +2010,7 @@ export default function App() {
 
       {(loadError || restoreError || dataState === 'cached') && <div role="alert" className={`shrink-0 px-4 py-3 text-xs flex flex-wrap items-center gap-2 ${loadError || restoreError ? 'bg-red-50 text-red-700' : 'bg-amber-50 text-amber-800'}`}><span className="flex-1">{loadError || restoreError || '当前为离线缓存。编辑保存需等待网络恢复；未收到服务器确认前不会显示已同步。'}</span>{loadError && <button disabled={syncing} onClick={() => { setDataState('loading'); setLoadError(''); setLoadAttempt(value => value + 1); }} className="underline font-bold">重试读取</button>}{restoreError && <button onClick={() => setRestoreError('')} className="font-bold underline">知道了</button>}</div>}
 
-      {isReportsOpen && <MonthlyReports courses={statisticsCourses} collectLessons={collectCompletedLessons} now={statisticsNow} onClose={closeReports} />}
+      {isReportsOpen && <MonthlyReports courses={statisticsCourses} collectLessons={collectCompletedLessons} now={statisticsNow} andy={andy} onClose={closeReports} />}
       {isTuitionOpen && <TuitionPackages key={user?.uid || 'signed-out'} state={tuition.state} results={tuition.results} pending={tuition.pending} onCommand={async command => { await tuition.commit(command); setStatisticsNow(new Date()); }} courses={courses} now={statisticsNow} viewWeekId={viewWeekId} onClose={closeTuition} />}
       {zoneConverter && <TimeZoneConverter initial={zoneConverter} onClose={closeZoneConverter} onUse={applyConvertedTime} />}
       {isStatisticsOpen && statisticsResult && (
@@ -2033,6 +2037,7 @@ export default function App() {
                 <p className="text-lg font-black text-indigo-700 mt-2">共上课{statisticsResult.count}次｜总计{formatLessonHours(statisticsResult.minutes)}课时</p>
                 <p className="text-xs text-slate-500 mt-2">按本地时间统计已结束课程；1小时＝1课时。未来和进行中的课程不计入。</p>
               </div>
+              <AndyStatistics counter={andy} range={statisticsRange} />
               {statisticsResult.count === 0 ? <p className="text-center text-slate-500 py-8">所选日期范围内暂无已完成课程</p> : statisticsResult.groups.map(group => (
                 <details key={group.category} open className={`rounded-xl border ${TAGS[group.category]?.theme.border || 'border-slate-200'} ${TAGS[group.category]?.theme.bg || 'bg-slate-50'}`}>
                   <summary className="cursor-pointer p-4 font-bold">
@@ -2059,6 +2064,7 @@ export default function App() {
       )}
 
       <div ref={scheduleViewportRef} className={`flex-1 min-h-0 overflow-auto relative z-0 transition-colors duration-300 ${isViewingCurrentWeek ? 'bg-indigo-50/80' : 'bg-slate-100/70'} ${isZenMode || isCssFullscreen ? 'p-0' : 'p-3 sm:p-6'}`}>
+        <AndyCounter key={user?.uid || 'signed-out'} counter={andy} side={andyAtSide} />
         
         {courses.length === 0 && dataState === 'ready' && !syncing && !hideEmptyOverlay && (
           <div className="absolute inset-0 z-[100] flex items-center justify-center bg-slate-900/60 backdrop-blur-md p-4 animate-in fade-in">

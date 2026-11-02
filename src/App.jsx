@@ -2064,7 +2064,9 @@ export default function App() {
       )}
 
       <div ref={scheduleViewportRef} className={`flex-1 min-h-0 overflow-auto relative z-0 transition-colors duration-300 ${isViewingCurrentWeek ? 'bg-indigo-50/80' : 'bg-slate-100/70'} ${isZenMode || isCssFullscreen ? 'p-0' : 'p-3 sm:p-6'}`}>
-        <AndyCounter key={user?.uid || 'signed-out'} counter={andy} side={andyAtSide} />
+        <div className={andyAtSide ? 'andy-counter-rail' : undefined}>
+          <AndyCounter key={user?.uid || 'signed-out'} counter={andy} side={andyAtSide} />
+        </div>
         
         {courses.length === 0 && dataState === 'ready' && !syncing && !hideEmptyOverlay && (
           <div className="absolute inset-0 z-[100] flex items-center justify-center bg-slate-900/60 backdrop-blur-md p-4 animate-in fade-in">

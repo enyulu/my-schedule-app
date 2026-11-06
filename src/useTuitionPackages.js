@@ -1,21 +1,38 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createTuitionStore } from './tuitionStore.js';
 import { tuitionStartDate, calculateTuition, collectTuitionOccurrences } from './tuitionPackages.js';
 
 const empty = { accounts: [], packages: [], bindings: [], adjustments: [], audit: [], status: 'loading', error: '' };
+const mergeBindings = (rows, confirmed) => {
+  const next = new Map(rows.map(row => [row.courseId, row]));
+  for (const [id, row] of confirmed) if ((next.get(id)?.version || 0) < row.version) next.set(id, row);
+  return [...next.values()];
+};
 export default function useTuitionPackages({ db, appId, userId, courses, now }) {
   const userRef = useRef(userId), inFlight = useRef(false), storeRef = useRef(null);
+  const confirmedBindings = useRef(new Map());
   const [snapshot, setSnapshot] = useState({ ...empty, userId: null });
   const [pending, setPending] = useState(false);
   useEffect(() => {
     userRef.current = userId;
+    confirmedBindings.current.clear();
     if (!userId) { storeRef.current = null; return; }
     let active = true;
     const store = createTuitionStore({ db, appId, userId, isCurrentUser: () => active && userRef.current === userId });
     storeRef.current = store;
-    const close = store.subscribe(state => setSnapshot({ ...state, userId }));
+    const close = store.subscribe(state => {
+      const confirmed = confirmedBindings.current;
+      for (const row of state.bindings) if (confirmed.has(row.courseId) && row.version >= confirmed.get(row.courseId).version) confirmed.delete(row.courseId);
+      setSnapshot({ ...state, bindings: mergeBindings(state.bindings, confirmed), userId });
+    });
     return () => { active = false; close(); storeRef.current = null; };
   }, [db, appId, userId]);
+  const applyCourseBindings = useCallback((owner, receipts) => {
+    if (owner !== userRef.current || !receipts.length) return;
+    for (const { id, after } of receipts) confirmedBindings.current.set(id, after);
+    const received = new Map(receipts.map(({ id, after }) => [id, after]));
+    setSnapshot(previous => previous.userId === owner ? { ...previous, bindings: mergeBindings(previous.bindings, received) } : previous);
+  }, []);
   const state = snapshot.userId === userId ? snapshot : empty;
   const results = useMemo(() => {
     const linked = new Set(state.bindings.map(binding => binding.courseId));
@@ -39,5 +56,5 @@ export default function useTuitionPackages({ db, appId, userId, courses, now }) 
     inFlight.current = true; setPending(true);
     try { await store.commit(command); } finally { inFlight.current = false; setPending(false); }
   };
-  return { state, results, pending, commit };
+  return { state, results, pending, commit, applyCourseBindings };
 }

@@ -9,6 +9,8 @@ const parseAndyDay = value => {
   if (!Number.isFinite(date.getTime()) || localAndyDate(date) !== value) throw Error('请选择有效日期');
   return date;
 };
+export const isAndyDateSelected = (date, month, today) =>
+  typeof date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(date) && date.slice(0, 7) === month && date <= today;
 export const createAndyBackfill = (date, count, now = new Date(), makeId = () => crypto.randomUUID()) => {
   const day = parseAndyDay(date);
   if (date > localAndyDate(now)) throw Error('不能补录未来日期的上课记录');

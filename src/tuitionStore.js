@@ -109,6 +109,17 @@ export const createCourseWriteBatch = ({ db, appId, userId, isCurrentUser, befor
         if (op.method === 'delete') after.delete(id);
         else after.set(id, { ...(op.method === 'update' ? after.get(id) || {} : {}), ...op.data, id });
       }
+      // Schedule backups contain no binding history. Refuse to guess how a
+      // changed or missing source should affect a prepaid balance.
+      const assertRecoverySafe = binding => {
+        const id = binding.courseId;
+        if (!recovery || !touched.has(id) || !binding.segments?.some(segment => segment.accountId)) return;
+        const fingerprint = course => course ? canonical(normalizeCourse(course)) : null;
+        if (fingerprint(before.get(id)) !== fingerprint(after.get(id))) {
+          throw Error('课包关联无法随此备份恢复：备份会修改或移除已关联课包的课程，但不含关联历史。请先核对课包，再选择不会改变关联课程的备份。');
+        }
+      };
+      if (recovery) (tuitionState.bindings || []).forEach(assertRecoverySafe);
       const plan = planBindingMutation({ beforeCourses, afterCourses: [...after.values()], bindings: tuitionState.bindings || [], accounts: tuitionState.accounts || [], inheritances, selections, overrides, relocations, recovery });
       if (ops.length + plan.bindingChanges.length + 2 > 500) throw Error('相关课程和课包修改超过一次安全事务限制，请减少操作数量');
       plan.bindingChanges.forEach(change => validateTuitionRecord(change.collection, change.data));
@@ -144,6 +155,7 @@ export const createCourseWriteBatch = ({ db, appId, userId, isCurrentUser, befor
         currentBindings.forEach((snapshot, index) => {
           const original = tuitionState.bindings?.find(binding => binding.courseId === bindingIds[index]);
           if ((snapshot.exists() ? snapshot.data().version : 0) !== (original?.version || 0)) throw Error('课包关联已被修改，请刷新后重试');
+          if (recovery && snapshot.exists()) assertRecoverySafe({ ...snapshot.data(), courseId: bindingIds[index] });
         });
         selectedAccounts.forEach((snapshot, index) => {
           if (!snapshot.exists()) throw Error('关联的课包账户不存在');

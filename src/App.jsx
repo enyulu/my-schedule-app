@@ -1,5 +1,7 @@
-import { useState, useMemo, useEffect, useRef, useCallback } from 'react';
+import { useState, useMemo, useEffect, useRef, useCallback, useSyncExternalStore } from 'react';
 import { clampScheduleZoom, getScheduleFitPercent, getScheduleGridPoint, getScheduleStartMinutes } from './scheduleZoom';
+import ScheduleActions from './ScheduleActions.jsx';
+import { readScheduleView, resolveScheduleView, saveScheduleView, compactScheduleSnapshot, subscribeCompactSchedule } from './scheduleView.js';
 import MonthlyReports from './MonthlyReports.jsx';
 import TuitionPackages from './TuitionPackages.jsx';
 import useTuitionPackages from './useTuitionPackages.js';
@@ -9,6 +11,7 @@ import useAndyCounter from './useAndyCounter.js';
 import { createCourseWriteBatch } from './tuitionStore.js';
 import { bindingAccountAt, calculateTuition, collectTuitionOccurrences, tuitionHours, tuitionStartDate } from './tuitionPackages.js';
 import { filterKnownOccurrences } from './monthlyReports.js';
+import { buildFinanceExport, createFinanceCsv, FINANCE_CATEGORIES, financeCategoryLabel } from './financeExport.js';
 import TimeZoneConverter, { CourseTimeZonePanel, CourseTimeZoneBadge, TimePicker } from './TimeZoneAssistant.jsx';
 import { courseDateSelection } from './courseDate.js';
 import { studentTimeZoneDefault } from './studentDefaults.js';
@@ -226,57 +229,6 @@ const callGeminiAPI = async (prompt) => {
 const currentRealMonday = getMonday(new Date());
 const currentWeekId = getWeekId(currentRealMonday);
 
-// --- 初始化种子数据 ---
-const INITIAL_COURSES = [
-  { id: 'm1', title: '子蕙', colIndex: 0, startTime: '10:00', endTime: '11:00', value: 240, isFixed: false, weekId: currentWeekId, tag: 'A', notes: '' },
-  { id: 'm2', title: '海辰数学', colIndex: 0, startTime: '17:00', endTime: '18:00', value: 400, isFixed: true, weekId: null, excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 'm3', title: '张恋一', colIndex: 0, startTime: '18:00', endTime: '19:00', value: 240, isFixed: false, weekId: currentWeekId, tag: 'P', notes: '' },
-  { id: 'm4', title: '泽源', colIndex: 0, startTime: '19:00', endTime: '20:00', value: 300, isFixed: false, weekId: currentWeekId, tag: 'B', notes: '' },
-  { id: 'm5', title: 'Ella计算机', colIndex: 0, startTime: '20:00', endTime: '21:00', value: 400, isFixed: false, weekId: currentWeekId, tag: 'P', notes: '' },
-  { id: 't1', title: '晴朗', colIndex: 1, startTime: '10:00', endTime: '11:30', value: 260, isFixed: false, weekId: currentWeekId, tag: 'P', notes: '' },
-  { id: 't2', title: 'Samantha', colIndex: 1, startTime: '13:00', endTime: '14:00', value: 400, isFixed: true, weekId: null, excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 't3', title: 'Michael香港', colIndex: 1, startTime: '14:30', endTime: '16:00', value: 400, isFixed: true, weekId: null, excludedWeeks: [], tag: 'A', notes: '' },
-  { id: 't4', title: '依宸', colIndex: 1, startTime: '17:00', endTime: '18:00', value: 240, isFixed: true, weekId: null, excludedWeeks: [], tag: 'A', notes: '' },
-  { id: 't5', title: '泽源', colIndex: 1, startTime: '18:00', endTime: '19:00', value: 300, isFixed: true, weekId: null, excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 't6', title: 'Ella计算机', colIndex: 1, startTime: '20:00', endTime: '21:00', value: 400, isFixed: false, weekId: currentWeekId, tag: 'P', notes: '' },
-  { id: 'w1', title: 'Nancy cs', colIndex: 2, startTime: '19:00', endTime: '20:00', value: 300, isFixed: true, weekId: null, excludedWeeks: [], tag: 'B', notes: '' },
-  { id: 'w2', title: 'Ella计算机', colIndex: 2, startTime: '20:00', endTime: '21:00', value: 400, isFixed: false, weekId: currentWeekId, tag: 'P', notes: '' },
-  { id: 'th1', title: 'Michael香港', colIndex: 3, startTime: '14:00', endTime: '15:30', value: 400, isFixed: true, weekId: null, excludedWeeks: [], tag: 'A', notes: '' },
-  { id: 'th2', title: '海辰数学', colIndex: 3, startTime: '16:00', endTime: '17:00', value: 400, isFixed: true, weekId: null, excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 'th3', title: '海辰数学', colIndex: 3, startTime: '17:00', endTime: '18:00', value: 240, isFixed: true, weekId: null, excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 'th4', title: 'Michael经济', colIndex: 3, startTime: '19:00', endTime: '20:00', value: 220, isFixed: true, weekId: null, excludedWeeks: [], tag: 'A', notes: '' },
-  { id: 'th5', title: '子蕙', colIndex: 3, startTime: '20:00', endTime: '21:00', value: 240, isFixed: false, weekId: currentWeekId, tag: 'A', notes: '' },
-  { id: 'f1', title: 'Samantha', colIndex: 4, startTime: '13:00', endTime: '14:00', value: 400, isFixed: true, weekId: null, excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 'f2', title: '泽源', colIndex: 4, startTime: '17:00', endTime: '18:00', value: 300, isFixed: true, weekId: null, excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 'f4', title: '子蕙', colIndex: 4, startTime: '18:00', endTime: '20:00', value: 240, isFixed: false, weekId: currentWeekId, tag: 'A', notes: '' },
-  { id: 'f3', title: 'Michael经济', colIndex: 4, startTime: '19:00', endTime: '20:00', value: 220, isFixed: true, weekId: null, excludedWeeks: [], tag: 'A', notes: '' },
-  { id: 'f5', title: '哲元', colIndex: 4, startTime: '20:00', endTime: '21:00', value: 220, isFixed: true, weekId: null, excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 's1', title: 'Tomo', colIndex: 5, startTime: '09:00', endTime: '11:00', value: 400, isFixed: true, weekId: null, excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 's2', title: '泽源', colIndex: 5, startTime: '17:00', endTime: '18:00', value: 300, isFixed: true, weekId: null, excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 'sn1', title: 'David 商务', colIndex: 6, startTime: '11:00', endTime: '12:00', value: 220, isFixed: true, weekId: null, excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 'sn2', title: 'Tomo', colIndex: 6, startTime: '13:00', endTime: '15:00', value: 400, isFixed: true, weekId: null, excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 'sn3', title: 'Louis CS', colIndex: 6, startTime: '19:00', endTime: '20:00', value: 400, isFixed: true, weekId: null, excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 'cs20260705', title: 'CS', colIndex: 6, startTime: '17:00', endTime: '18:30', value: 400, isFixed: true, weekId: null, baseWeekId: '2026-06-29', endWeekId: '2026-07-06', excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 'cs20260709', title: 'CS', colIndex: 3, startTime: '17:00', endTime: '18:30', value: 400, isFixed: true, weekId: null, baseWeekId: '2026-07-06', endWeekId: '2026-07-13', excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 'cs20260713', title: 'CS', colIndex: 0, startTime: '17:00', endTime: '18:30', value: 400, isFixed: true, weekId: null, baseWeekId: '2026-07-13', endWeekId: '2026-07-20', excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 'cs20260715', title: 'CS', colIndex: 2, startTime: '17:00', endTime: '18:30', value: 400, isFixed: true, weekId: null, baseWeekId: '2026-07-13', endWeekId: '2026-07-20', excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 'cs20260717', title: 'CS', colIndex: 4, startTime: '17:00', endTime: '18:30', value: 400, isFixed: true, weekId: null, baseWeekId: '2026-07-13', endWeekId: '2026-07-20', excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 'cs20260720', title: 'CS', colIndex: 0, startTime: '17:00', endTime: '18:30', value: 400, isFixed: true, weekId: null, baseWeekId: '2026-07-20', endWeekId: '2026-07-27', excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 'cs20260722', title: 'CS', colIndex: 2, startTime: '17:00', endTime: '18:30', value: 400, isFixed: true, weekId: null, baseWeekId: '2026-07-20', endWeekId: '2026-07-27', excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 'cs20260724', title: 'CS', colIndex: 4, startTime: '17:00', endTime: '18:30', value: 400, isFixed: true, weekId: null, baseWeekId: '2026-07-20', endWeekId: '2026-07-27', excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 'cs20260808', title: 'CS', colIndex: 5, startTime: '17:00', endTime: '18:30', value: 400, isFixed: true, weekId: null, baseWeekId: '2026-08-03', endWeekId: '2026-08-10', excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 'cs20260810', title: 'CS', colIndex: 0, startTime: '17:00', endTime: '18:30', value: 400, isFixed: true, weekId: null, baseWeekId: '2026-08-10', endWeekId: '2026-08-17', excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 'cs20260812', title: 'CS', colIndex: 2, startTime: '17:00', endTime: '18:30', value: 400, isFixed: true, weekId: null, baseWeekId: '2026-08-10', endWeekId: '2026-08-17', excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 'cs20260814', title: 'CS', colIndex: 4, startTime: '17:00', endTime: '18:30', value: 400, isFixed: true, weekId: null, baseWeekId: '2026-08-10', endWeekId: '2026-08-17', excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 'cs20260817', title: 'CS', colIndex: 0, startTime: '17:00', endTime: '18:30', value: 400, isFixed: true, weekId: null, baseWeekId: '2026-08-17', endWeekId: '2026-08-24', excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 'cs20260819', title: 'CS', colIndex: 2, startTime: '17:00', endTime: '18:30', value: 400, isFixed: true, weekId: null, baseWeekId: '2026-08-17', endWeekId: '2026-08-24', excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 'cs20260821', title: 'CS', colIndex: 4, startTime: '17:00', endTime: '18:30', value: 400, isFixed: true, weekId: null, baseWeekId: '2026-08-17', endWeekId: '2026-08-24', excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 'cs20260823', title: 'CS', colIndex: 6, startTime: '17:00', endTime: '18:30', value: 400, isFixed: true, weekId: null, baseWeekId: '2026-08-17', endWeekId: '2026-08-24', excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 'cs20260825', title: 'CS', colIndex: 1, startTime: '17:00', endTime: '18:30', value: 400, isFixed: true, weekId: null, baseWeekId: '2026-08-24', endWeekId: '2026-08-31', excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 'cs20260902', title: 'CS', colIndex: 2, startTime: '17:00', endTime: '18:30', value: 400, isFixed: true, weekId: null, baseWeekId: '2026-08-31', endWeekId: '2026-09-07', excludedWeeks: [], tag: 'P', notes: '' },
-  { id: 'cs20260904', title: 'CS', colIndex: 4, startTime: '17:00', endTime: '18:30', value: 400, isFixed: true, weekId: null, baseWeekId: '2026-08-31', endWeekId: '2026-09-07', excludedWeeks: [], tag: 'P', notes: '' },
-];
-
 const COURSE_SCHEMA_VERSION = 4;
 const COURSE_TIME_PATTERN = /^([01]\d|2[0-3]):([0-5]\d)$/;
 
@@ -433,8 +385,6 @@ const normalizeCourseDataset = (rawData, source, targetWeekId = currentWeekId) =
   return validCourses;
 };
 
-const createDefaultSchedule = (targetWeekId = currentWeekId) =>
-  normalizeCourseDataset(INITIAL_COURSES, 'local-seed', targetWeekId);
 
 const getCoursesRef = userId =>
   collection(db, 'artifacts', FIXED_APP_ID, 'users', userId, 'courses');
@@ -573,7 +523,9 @@ export default function App() {
   }, []);
   useEffect(() => {
     if (!isStatisticsOpen) return;
-    const trigger = statisticsTriggerRef.current;
+    const button = statisticsTriggerRef.current;
+    // The mobile launcher is inside a sheet that closes before this opens.
+    const trigger = button?.getClientRects().length ? button : document.activeElement;
     statisticsCloseRef.current?.focus();
     const handleKey = (event) => {
       if (event.key === 'Escape') setIsStatisticsOpen(false);
@@ -596,7 +548,13 @@ export default function App() {
   const canEdit = Boolean(user) && !loadError && (dataState === 'ready' || (dataState === 'cached' && courses.length > 0));
   const [overlapState, setOverlapState] = useState({});
   const [hideEmptyOverlay, setHideEmptyOverlay] = useState(false);
-  const [scheduleView, setScheduleView] = useState('week');
+  const compactSchedule = useSyncExternalStore(subscribeCompactSchedule, compactScheduleSnapshot);
+  const [viewPreference, setScheduleView] = useState(() => readScheduleView());
+  const scheduleView = resolveScheduleView(viewPreference, compactSchedule);
+  const switchScheduleView = () => {
+    const next = scheduleView === 'week' ? 'list' : 'week';
+    setScheduleView(next); saveScheduleView(undefined, next);
+  };
   const andyAtSide = (scheduleViewportWidth - (scheduleView === 'list' ? 768 : scheduleWidth * scheduleZoom / 100)) / 2 >= 296;
   const touchStartRef = useRef(null);
   
@@ -1025,44 +983,16 @@ export default function App() {
   }, [courses]);
 
   const exportResult = useMemo(() => {
-    if (!isExportModalOpen || !exportRange.start || !exportRange.end) return null;
-    const [sy, sm, sd] = exportRange.start.split('-').map(Number);
-    const [ey, em, ed] = exportRange.end.split('-').map(Number);
-    const start = new Date(sy, sm - 1, sd, 0, 0, 0);
-    const end = new Date(ey, em - 1, ed, 23, 59, 59, 999);
-    const today = new Date();
-    today.setHours(23, 59, 59, 999);
-    const res = { totals: { A: 0, B: 0, P: 0 }, details: { A: [], B: [], P: [] }, totalAll: 0 };
-    
-    for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
-      if (d > today) continue; 
-      const cd = new Date(d), ci = cd.getDay() === 0 ? 6 : cd.getDay() - 1, wid = getWeekId(getMonday(cd));
-      const active = courses.filter(c => {
-        if (c.colIndex !== ci) return false;
-        if (c.isFixed) {
-          const isAfterStart = c.baseWeekId ? wid >= c.baseWeekId : true;
-          const isBeforeEnd = c.endWeekId ? wid < c.endWeekId : true;
-          return isAfterStart && isBeforeEnd && !(c.excludedWeeks?.includes(wid)) && (!c.isBiweekly || getDiffWeeks(c.baseWeekId, wid) % 2 === 0);
-        }
-        return c.weekId === wid;
-      }).sort((a,b) => timeToMinutes(a.startTime) - timeToMinutes(b.startTime));
-      
-      active.forEach(c => {
-        const baseName = c.title ? c.title.replace(/\s*\(第\d+课\)/g, '').trim() : '';
-        if (exportCourseFilter && baseName !== exportCourseFilter) return;
-
-        const v = getCourseTotalValue(c, cd), tag = c.tag || 'P';
-        let durMins = timeToMinutes(c.endTime) - timeToMinutes(c.startTime);
-        if (durMins < 0) durMins += 1440;
-        res.totals[tag] += v;
-        res.totalAll += v;
-        const { title: displayTitle, dynamicNote } = getCourseDisplayInfo(c, wid);
-        const finalNotes = [dynamicNote, c.notes].filter(Boolean).join(' | ');
-        res.details[tag].push({ date: `${cd.getFullYear()}-${formatDate(cd)}`, title: displayTitle, time: `${c.startTime}-${c.endTime}`, duration: `${durMins / 60} 小时`, value: v, notes: finalNotes });
-      });
-    }
-    return res;
-  }, [isExportModalOpen, exportRange, exportCourseFilter, courses, getCourseDisplayInfo]);
+    if (!isExportModalOpen || !parseLocalDate(exportRange.start) || !parseLocalDate(exportRange.end) || exportRange.start > exportRange.end) return null;
+    // The selected range applies to the start date, not the end of a lesson.
+    const completed = collectCompletedLessons(statisticsCourses, exportRange, statisticsNow, { includeUnfinished: true })
+      .filter(lesson => lesson.endsAt <= statisticsNow.getTime());
+    const lessons = filterKnownOccurrences(statisticsCourses, completed, statisticsNow).lessons;
+    return buildFinanceExport({
+      courses, lessons, courseFilter: exportCourseFilter,
+      displayInfo: (course, date) => getCourseDisplayInfo(course, getWeekId(getMonday(parseLocalDate(date)))),
+    });
+  }, [isExportModalOpen, exportRange, exportCourseFilter, courses, statisticsCourses, statisticsNow, getCourseDisplayInfo]);
 
   const saveSnapshotForUndo = useCallback(() => { pendingUndoRef.current = { courses: JSON.parse(JSON.stringify(coursesRefLatest.current)), bindings: JSON.parse(JSON.stringify(tuition.state.bindings)) }; }, [tuition.state.bindings]);
 
@@ -1308,21 +1238,6 @@ export default function App() {
     } finally { saveInFlightRef.current = false; setSyncing(false); }
   };
 
-  const restoreInitialData = async () => {
-    if (!user || !canEdit || syncing || saveInFlightRef.current) return;
-    if (!window.confirm('确认载入示例课表？这会替换当前课程，并先保存恢复前副本。日常新增无需初始化。')) return;
-    saveInFlightRef.current = true; setSyncing(true); setRestoreError('');
-    try {
-      const localSeed = createDefaultSchedule(viewWeekId);
-      saveSnapshotForUndo();
-      const initialized = await replaceFirestoreSchedule(user.uid, localSeed, 'manual-local-seed', viewWeekId, () => activeUserIdRef.current === user.uid, courseWriteBatch);
-      if (activeUserIdRef.current !== user.uid) return;
-      setCourses(initialized); setHideEmptyOverlay(true);
-    } catch (error) {
-      logFirestoreError('initialize:local-seed', error);
-      setRestoreError(`初始化未完成，原课表保持不变：${error.message}`);
-    } finally { saveInFlightRef.current = false; setSyncing(false); }
-  };
 
   const handleCopyBackup = () => {
     try {
@@ -1790,19 +1705,11 @@ export default function App() {
   };
 
   const downloadCSV = () => {
-    if (!exportResult || exportResult.totalAll === 0) return;
-    let csv = '\uFEFF标签,日期,课程,上课时间,时长,结算,备注\n';
-    ['A', 'B', 'P'].forEach(tag => {
-      if (exportResult.details[tag] && exportResult.details[tag].length > 0) {
-        exportResult.details[tag].forEach(r => { 
-          const safeNotes = r.notes ? `"${String(r.notes).replace(/"/g, '""')}"` : '';
-          csv += `${tag},${r.date},${r.title},${r.time},${r.duration},${r.value},${safeNotes}\n`; 
-        });
-        csv += `${tag}总计,,,,,,${exportResult.totals[tag]}\n\n`;
-      }
-    });
-    const link = document.createElement('a'); link.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8;' }));
+    if (!exportResult?.count) return;
+    const url = URL.createObjectURL(new Blob([createFinanceCsv(exportResult)], { type: 'text/csv;charset=utf-8;' }));
+    const link = document.createElement('a'); link.href = url;
     link.download = `财务明细导出${exportCourseFilter ? `_${exportCourseFilter}` : '_全部课程'}_${exportRange.start}_${exportRange.end}.csv`; link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
   // --- 登录页面拦截 ---
@@ -1857,9 +1764,56 @@ export default function App() {
     );
   }
 
+  const agendaDays = DAYS.map((day, colIndex) => {
+    const date = occurrenceDate(viewWeekId, colIndex);
+    return { day, colIndex, date, today: date === formatLocalDate(statisticsNow) };
+  });
+  if (compactSchedule) agendaDays.sort((a, b) => Number(b.today) - Number(a.today));
+  const scheduleSummary = <>
+    <div className="text-sm font-bold text-purple-600 flex flex-wrap items-center gap-x-4 gap-y-2 mt-1">
+      <span>本周排课预计: ¥{String(totals.weekly)}</span>
+      <span>本月已完成课酬: ¥{String(completedSummary.fee)}</span>
+    </div>
+    <div className="text-sm font-bold text-teal-700 flex flex-wrap items-center gap-x-4 gap-y-2 mt-2">
+      <span>本周已上课时：{formatLessonHours(completedSummary.week)}课时</span>
+      <span>本月已上课时：{formatLessonHours(completedSummary.month)}课时</span>
+      <button ref={statisticsTriggerRef} onClick={() => {
+        const range = getStatisticsRange('month');
+        setStatisticsDraft(range); setStatisticsRange(range); setStatisticsError('');
+        setStatisticsNow(new Date()); setIsStatisticsOpen(true);
+      }} className="inline-flex items-center gap-1 px-2 py-1 text-xs bg-teal-50 text-teal-700 border border-teal-200 rounded-lg hover:bg-teal-100">
+        <Clock size={14} />课时统计
+      </button>
+      <button type="button" onClick={() => { setStatisticsNow(new Date()); setIsReportsOpen(true); }} className="inline-flex items-center gap-1 px-2 py-1 text-xs bg-indigo-50 text-indigo-600 border border-indigo-200 rounded-lg hover:bg-indigo-100"><BarChart3 size={14} />统计报告</button>
+      <button type="button" onClick={() => { setStatisticsNow(new Date()); setIsTuitionOpen(true); }} className="inline-flex items-center gap-1 px-2 py-1 text-xs bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-lg hover:bg-emerald-100"><Layers size={14} />课包管理</button>
+      <button type="button" onClick={() => openTimeZoneConverter()} className="inline-flex items-center gap-1 px-2 py-1 text-xs bg-sky-50 text-sky-700 border border-sky-200 rounded-lg hover:bg-sky-100"><Globe2 size={14} />时区换算</button>
+    </div>
+    {completedSummary.undatedCount > 0 && <p className="text-[10px] text-amber-700 mt-1">部分旧固定课缺少起始日期，历史统计采用保守口径；详见统计报告。</p>}
+  </>;
+  const scheduleBackup = (
+    <details className="bg-slate-50/80 px-4 sm:px-6 py-2.5 border-b border-slate-200 text-[12px]">
+      <summary className="text-slate-500 font-bold cursor-pointer list-none tracking-wide"><Settings2 size={14} className="inline mr-1" />设置与备份 <ChevronDown size={12} className="inline ml-1" /></summary>
+
+      <div className="flex flex-wrap items-center gap-2 mt-3">
+        <button onClick={() => { setBackupText(JSON.stringify(coursesRefLatest.current, null, 2)); setBackupStatus(""); setIsBackupModalOpen(true); }} className="px-3 py-1.5 bg-white text-slate-600 border border-slate-200 rounded-md font-bold shadow-sm hover:bg-slate-50 transition-all flex items-center gap-1">
+          <Database size={14} /> 手动备份代码
+        </button>
+        <button disabled={syncing || !canEdit} onClick={() => restoreLatestSchedule()} className="px-3 py-1.5 bg-white text-indigo-600 border border-indigo-100 rounded-md font-bold shadow-sm hover:bg-indigo-50 transition-all flex items-center gap-1 disabled:opacity-40">
+          <RefreshCw size={14} /> 从云端恢复备份
+        </button>
+        <button disabled={syncing || !canEdit} onClick={() => restoreLatestSchedule('pre_restore_backup')} className="px-3 py-1.5 bg-white border border-slate-200 rounded-md font-bold disabled:opacity-40">恢复前副本</button>
+        <button data-menu-stay-open onClick={handleUpdateTemplate} disabled={!!isSavingTemplate || syncing || !canEdit} className={`px-4 py-1.5 rounded-md font-bold shadow-sm transition-all flex items-center gap-1 border bg-emerald-50 text-emerald-600 border-emerald-200 disabled:opacity-40`}>
+          {isSavingTemplate === 'saving' ? <><RefreshCw size={14} className="animate-spin" /> 保存中</> :
+           isSavingTemplate === 'success' ? <><Cloud size={14} /> 云端备份已保存</> :
+           <><Cloud size={14} /> 保存云端备份</>}
+        </button>
+      </div>
+      {compactSchedule && restoreError && <p role="alert" className="mt-2 text-xs text-red-700">{restoreError}</p>}
+    </details>
+  );
   // --- 主界面 ---
   return (
-    <div ref={appContainerRef} className={`flex flex-col text-slate-800 font-sans text-[13px] transition-all duration-300 ${isCssFullscreen ? 'fixed inset-0 z-[9999] w-screen h-screen m-0 p-0 overflow-hidden bg-white' : 'h-screen bg-white'}`}>
+    <div ref={appContainerRef} className={`flex flex-col text-slate-800 font-sans text-[13px] transition-all duration-300 ${isCssFullscreen ? 'fixed inset-0 z-[9999] w-screen h-screen m-0 p-0 overflow-hidden bg-white' : 'h-[100dvh] bg-white'}`}>
       {courseCelebration && (
         <div key={courseCelebration.id} aria-hidden="true" className={`p-course-celebration p-course-celebration--${courseCelebration.type}`}>
           <svg viewBox="0 0 200 200" fill="none" className="p-course-celebration__art">
@@ -1907,104 +1861,71 @@ export default function App() {
 
       {!isZenMode && (
         <header className="flex-shrink-0 bg-white z-30 flex flex-col shadow-sm relative">
-          <div className="px-4 sm:px-6 py-4 flex flex-wrap gap-4 items-center justify-between border-b border-slate-100">
-            <div className="flex items-center space-x-4">
-              <div className="bg-slate-800 p-2 text-white rounded-xl shadow-md"><Calendar size={24} /></div>
+          <div className="px-3 md:px-6 py-2.5 md:py-4 flex flex-wrap gap-2 md:gap-4 items-center justify-between border-b border-slate-100">
+            <div className="flex items-center gap-2.5 md:gap-4 min-w-0">
+              <div className="bg-slate-800 p-2 text-white rounded-xl shadow-sm shrink-0"><Calendar size={compactSchedule ? 17 : 24} /></div>
               <div>
-                <h1 className="text-xl font-black text-slate-800 tracking-tight flex items-center gap-3">
+                <h1 className="text-base md:text-xl font-black text-slate-800 tracking-tight flex flex-wrap items-center gap-2 md:gap-3">
                   每周固定课表
                   <span role="status" className={`text-[10px] px-2 py-0.5 rounded border flex items-center gap-1 ${restoreError || loadError ? 'text-red-600 bg-red-50 border-red-100' : syncing || dataState !== 'ready' ? 'text-amber-700 bg-amber-50 border-amber-100' : 'text-teal-600 bg-teal-50 border-teal-100'}`}>{syncing ? <RefreshCw size={10} className="animate-spin" /> : <Cloud size={10} />}{restoreError || loadError ? '操作未完成' : syncing ? '等待云端确认' : dataState === 'loading' ? '正在读取' : dataState === 'cached' ? '离线缓存' : '云端已同步'}</span>
                 </h1>
-                <div className="text-sm font-bold text-purple-600 flex flex-wrap items-center gap-x-4 gap-y-2 mt-1">
-                  <span>本周排课预计: ¥{String(totals.weekly)}</span>
-                  <span>本月已完成课酬: ¥{String(completedSummary.fee)}</span>
-                </div>
-                <div className="text-sm font-bold text-teal-700 flex flex-wrap items-center gap-x-4 gap-y-2 mt-2">
-                  <span>本周已上课时：{formatLessonHours(completedSummary.week)}课时</span>
-                  <span>本月已上课时：{formatLessonHours(completedSummary.month)}课时</span>
-                  <button ref={statisticsTriggerRef} onClick={() => {
-                    const range = getStatisticsRange('month');
-                    setStatisticsDraft(range); setStatisticsRange(range); setStatisticsError('');
-                    setStatisticsNow(new Date()); setIsStatisticsOpen(true);
-                  }} className="inline-flex items-center gap-1 px-2 py-1 text-xs bg-teal-50 text-teal-700 border border-teal-200 rounded-lg hover:bg-teal-100">
-                    <Clock size={14} />课时统计
-                  </button>
-                  <button type="button" onClick={() => { setStatisticsNow(new Date()); setIsReportsOpen(true); }} className="inline-flex items-center gap-1 px-2 py-1 text-xs bg-indigo-50 text-indigo-600 border border-indigo-200 rounded-lg hover:bg-indigo-100"><BarChart3 size={14} />统计报告</button>
-                  <button type="button" onClick={() => { setStatisticsNow(new Date()); setIsTuitionOpen(true); }} className="inline-flex items-center gap-1 px-2 py-1 text-xs bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-lg hover:bg-emerald-100"><Layers size={14} />课包管理</button>
-                  <button type="button" onClick={() => openTimeZoneConverter()} className="inline-flex items-center gap-1 px-2 py-1 text-xs bg-sky-50 text-sky-700 border border-sky-200 rounded-lg hover:bg-sky-100"><Globe2 size={14} />时区换算</button>
-                </div>
-                {completedSummary.undatedCount > 0 && <p className="text-[10px] text-amber-700 mt-1">部分旧固定课缺少起始日期，历史统计采用保守口径；详见统计报告。</p>}
+                {!compactSchedule && scheduleSummary}
               </div>
             </div>
 
-            <div className="flex flex-wrap items-center gap-3">
-              <div className={`flex items-center space-x-2 p-1 rounded-lg border mr-2 shadow-inner transition-colors ${isViewingCurrentWeek ? 'bg-indigo-50 border-indigo-200' : 'bg-slate-50 border-slate-100'}`}>
-                <button onClick={() => { const d = new Date(viewWeekStart); d.setDate(d.getDate()-7); setViewWeekStart(d); }} className="p-1.5 rounded-md hover:bg-white shadow-sm transition-all text-slate-600"><ChevronLeft size={20} /></button>
-                <span className={`text-sm font-bold w-32 text-center tracking-wide ${isViewingCurrentWeek ? 'text-indigo-700' : 'text-slate-800'}`}>
+            <div className="w-full md:w-auto flex flex-wrap items-center gap-1.5 md:gap-3">
+              <div className={`w-full md:w-auto flex items-center justify-between gap-1 p-0.5 md:p-1 rounded-xl border md:mr-2 transition-colors ${isViewingCurrentWeek ? 'bg-indigo-50 border-indigo-200' : 'bg-slate-50 border-slate-100'}`}>
+                <button type="button" aria-label="上一周" onClick={() => { const d = new Date(viewWeekStart); d.setDate(d.getDate()-7); setViewWeekStart(d); }} className="w-11 h-10 md:w-8 md:h-8 grid place-items-center rounded-md hover:bg-white transition-colors text-slate-600"><ChevronLeft size={19} /></button>
+                <span aria-live="polite" className={`text-xs md:text-sm font-bold md:w-40 text-center tabular-nums ${isViewingCurrentWeek ? 'text-indigo-700' : 'text-slate-800'}`}>
                   {isViewingCurrentWeek && <span className="block text-[9px] leading-none mb-0.5 tracking-[0.2em]">当前周</span>}
-                  {String(viewWeekStart.getFullYear())}年 {String(weekDates[0])}
+                  {String(viewWeekStart.getFullYear())}年 {String(weekDates[0])}—{String(weekDates[6])}
                 </span>
-                <button onClick={() => { const d = new Date(viewWeekStart); d.setDate(d.getDate()+7); setViewWeekStart(d); }} className="p-1.5 rounded-md hover:bg-white shadow-sm transition-all text-slate-600"><ChevronRight size={20} /></button>
+                <button type="button" aria-label="下一周" onClick={() => { const d = new Date(viewWeekStart); d.setDate(d.getDate()+7); setViewWeekStart(d); }} className="w-11 h-10 md:w-8 md:h-8 grid place-items-center rounded-md hover:bg-white transition-colors text-slate-600"><ChevronRight size={19} /></button>
               </div>
-              <button type="button" onClick={() => setViewWeekStart(getMonday(new Date()))} className="px-3 py-2 rounded-lg border border-slate-200 bg-white text-xs font-bold text-slate-600">回到本周</button>
-              <button type="button" onClick={() => setScheduleView(value => value === 'week' ? 'list' : 'week')} className="px-3 py-2 rounded-lg border border-indigo-100 bg-indigo-50 text-xs font-bold text-indigo-600">{scheduleView === 'week' ? '列表视图' : '周视图'}</button>
-              <button disabled={!canEdit || syncing} onClick={() => { setHideEmptyOverlay(true); openModal(); }} className="bg-indigo-600 text-white px-4 py-2.5 rounded-lg text-sm font-black shadow-sm hover:bg-indigo-700 disabled:opacity-40 flex items-center gap-1"><Plus size={17} />新增排课</button>
-              <details className="relative"><summary className="cursor-pointer list-none px-3 py-2.5 rounded-lg bg-white border border-slate-200 text-xs font-bold text-slate-600">更多操作 <ChevronDown size={12} className="inline" /></summary><div className="absolute right-0 top-full mt-2 z-[100] w-[min(340px,calc(100vw-32px))] bg-white border border-slate-200 rounded-xl shadow-xl p-3 flex flex-wrap gap-2">
-              <button onClick={toggleFullscreen} className="px-3 py-2.5 bg-white text-slate-600 border border-slate-200 rounded-lg text-sm font-bold shadow-sm hover:bg-slate-50 transition-all" title="全屏显示网页">
-                <Maximize2 size={16} />
+              <button type="button" aria-label="回到本周" onClick={() => setViewWeekStart(getMonday(new Date()))} className="h-11 md:h-auto px-2.5 md:px-3 md:py-2 rounded-xl border border-slate-200 bg-white text-xs font-bold text-slate-600">{compactSchedule ? '本周' : '回到本周'}</button>
+              <button type="button" onClick={switchScheduleView} className="h-11 md:h-auto px-2.5 md:px-3 md:py-2 rounded-xl border border-indigo-100 bg-indigo-50 text-xs font-bold text-indigo-600">{scheduleView === 'week' ? '列表视图' : '周视图'}</button>
+              <button type="button" disabled={!canEdit || syncing} onClick={() => { setHideEmptyOverlay(true); openModal(); }} className="h-11 md:h-auto flex-1 md:flex-none justify-center bg-indigo-600 text-white px-2.5 md:px-4 md:py-2.5 rounded-xl text-xs md:text-sm font-black shadow-sm hover:bg-indigo-700 disabled:opacity-40 flex items-center gap-1 whitespace-nowrap"><Plus size={17} />新增排课</button>
+              <ScheduleActions compact={compactSchedule}>
+              {compactSchedule && <div className="w-full rounded-2xl border border-indigo-100 bg-indigo-50/50 p-3 mb-1">{scheduleSummary}</div>}
+              <button onClick={toggleFullscreen} className="inline-flex items-center gap-1.5 px-3 py-2.5 bg-white text-slate-600 border border-slate-200 rounded-lg text-sm font-bold shadow-sm hover:bg-slate-50 transition-all" title="全屏显示网页">
+                <Maximize2 size={16} />{compactSchedule && <span>全屏</span>}
               </button>
-              <div role="group" aria-label="课表显示比例" className="flex items-center gap-1 p-1 bg-white border border-slate-200 rounded-lg shadow-sm">
+              <div role="group" aria-label="课表显示比例" data-menu-stay-open className="flex items-center gap-1 p-1 bg-white border border-slate-200 rounded-lg shadow-sm">
                 <button type="button" aria-label="缩小课表" title="缩小10%" disabled={scheduleZoom <= 60} onClick={() => setZoomPreference({ mode: 'manual', percent: clampScheduleZoom(scheduleZoom - 10) })} className="w-9 h-9 rounded-md font-bold text-lg hover:bg-slate-100 disabled:opacity-30 disabled:cursor-not-allowed">−</button>
                 <button type="button" aria-label={`当前比例${scheduleZoom}%，点击恢复100%`} title="恢复100%" onClick={() => setZoomPreference({ mode: 'manual', percent: 100 })} className="min-w-14 h-9 px-1 rounded-md font-bold text-indigo-600 hover:bg-indigo-50 tabular-nums">{scheduleZoom}%</button>
                 <button type="button" aria-label="放大课表" title="放大10%" disabled={scheduleZoom >= 140} onClick={() => setZoomPreference({ mode: 'manual', percent: clampScheduleZoom(scheduleZoom + 10) })} className="w-9 h-9 rounded-md font-bold text-lg hover:bg-slate-100 disabled:opacity-30 disabled:cursor-not-allowed">＋</button>
                 <button type="button" aria-pressed={zoomPreference.mode === 'fit'} title="按窗口宽度调整，最小60%；窄屏可横向滚动" onClick={() => setZoomPreference({ mode: 'fit', percent: scheduleZoom })} className={`h-9 px-2 rounded-md text-xs font-bold ${zoomPreference.mode === 'fit' ? 'bg-indigo-50 text-indigo-700' : 'text-slate-600 hover:bg-slate-100'}`}>适应窗口</button>
               </div>
               
-              <button onClick={toggleZenMode} className="px-3 py-2.5 bg-white text-slate-600 border border-slate-200 rounded-lg text-sm font-bold shadow-sm hover:bg-slate-50 transition-all" title="隐藏菜单栏">
-                <AlignLeft size={16} />
+              <button onClick={toggleZenMode} className="inline-flex items-center gap-1.5 px-3 py-2.5 bg-white text-slate-600 border border-slate-200 rounded-lg text-sm font-bold shadow-sm hover:bg-slate-50 transition-all" title="隐藏菜单栏">
+                <AlignLeft size={16} />{compactSchedule && <span>极简模式</span>}
               </button>
 
               <button onClick={handleAIAnalysis} className="px-4 py-2.5 bg-gradient-to-r from-indigo-50 to-purple-50 text-indigo-700 border border-indigo-200 rounded-lg text-[13px] font-black shadow-sm hover:opacity-80 transition-all flex items-center gap-1" title="获取本周排课分析">
                 <Sparkles size={16} className="text-purple-500" /> 智能顾问
               </button>
 
-              <button onClick={handleUndo} disabled={undoStack.length === 0 || syncing || !canEdit} className={`px-3 py-2.5 rounded-lg text-sm font-black shadow-sm transition-all flex items-center border ${undoStack.length > 0 ? 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50' : 'bg-slate-50 text-slate-300 border-slate-100 cursor-not-allowed'}`} title="撤销操作">
-                <Undo size={16} />
+              <button onClick={handleUndo} disabled={undoStack.length === 0 || syncing || !canEdit} className={`px-3 py-2.5 rounded-lg text-sm font-black shadow-sm transition-all flex items-center gap-1.5 border ${undoStack.length > 0 ? 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50' : 'bg-slate-50 text-slate-300 border-slate-100 cursor-not-allowed'}`} title="撤销操作">
+                <Undo size={16} />{compactSchedule && <span>撤销</span>}
               </button>
-              <button onClick={handleDownload} disabled={isDownloading} className="px-3 py-2.5 bg-white text-slate-600 border border-slate-200 rounded-lg text-sm font-bold shadow-sm hover:bg-slate-50 transition-all" title="下载图片">
-                <Download size={16} className={isDownloading ? "animate-bounce" : ""} />
+              <button onClick={handleDownload} disabled={isDownloading} className="inline-flex items-center gap-1.5 px-3 py-2.5 bg-white text-slate-600 border border-slate-200 rounded-lg text-sm font-bold shadow-sm hover:bg-slate-50 transition-all" title="下载图片">
+                <Download size={16} className={isDownloading ? "animate-bounce" : ""} />{compactSchedule && <span>下载图片</span>}
               </button>
               <button onClick={() => setIsExportModalOpen(true)} className="px-4 py-2.5 bg-white text-indigo-600 border border-indigo-100 rounded-lg text-[13px] font-black shadow-sm hover:bg-indigo-50 transition-all flex items-center gap-1">
                 <FileSpreadsheet size={16}/> 导出财务
               </button>
               <div className="w-[1px] h-6 bg-slate-200 mx-1"></div> 
               {isStandalone && (
-                <button disabled={syncing || isSavingTemplate} onClick={() => { if (!saveInFlightRef.current) signOut(auth); }} className="px-3 py-2.5 bg-red-50 text-red-600 border border-red-100 rounded-lg text-sm font-black shadow-sm hover:bg-red-100 transition-all flex items-center gap-1 ml-1 disabled:opacity-40" title="退出登录">
-                  <LogOut size={16} />
+                <button disabled={syncing || isSavingTemplate} onClick={() => { if (!saveInFlightRef.current) signOut(auth); }} className="px-3 py-2.5 bg-red-50 text-red-600 border border-red-100 rounded-lg text-sm font-black shadow-sm hover:bg-red-100 transition-all flex items-center gap-1.5 ml-1 disabled:opacity-40" title="退出登录">
+                  <LogOut size={16} />{compactSchedule && <span>退出登录</span>}
                 </button>
               )}
-              </div></details>
+              {compactSchedule && <div className="w-full rounded-xl border border-slate-100 overflow-hidden mt-1">{scheduleBackup}</div>}
+              </ScheduleActions>
             </div>
           </div>
 
-          <details className="bg-slate-50/80 px-4 sm:px-6 py-2.5 border-b border-slate-200 text-[12px]">
-            <summary className="text-slate-500 font-bold cursor-pointer list-none tracking-wide"><Settings2 size={14} className="inline mr-1" />设置与备份 <ChevronDown size={12} className="inline ml-1" /></summary>
-            
-            <div className="flex flex-wrap items-center gap-2 mt-3">
-              <button onClick={() => { setBackupText(JSON.stringify(coursesRefLatest.current, null, 2)); setBackupStatus(""); setIsBackupModalOpen(true); }} className="px-3 py-1.5 bg-white text-slate-600 border border-slate-200 rounded-md font-bold shadow-sm hover:bg-slate-50 transition-all flex items-center gap-1">
-                <Database size={14} /> 手动备份代码
-              </button>
-              <button disabled={syncing || !canEdit} onClick={() => restoreLatestSchedule()} className="px-3 py-1.5 bg-white text-indigo-600 border border-indigo-100 rounded-md font-bold shadow-sm hover:bg-indigo-50 transition-all flex items-center gap-1 disabled:opacity-40">
-                <RefreshCw size={14} /> 从云端恢复备份
-              </button>
-              <button disabled={syncing || !canEdit} onClick={() => restoreLatestSchedule('pre_restore_backup')} className="px-3 py-1.5 bg-white border border-slate-200 rounded-md font-bold disabled:opacity-40">恢复前副本</button>
-              <button onClick={handleUpdateTemplate} disabled={!!isSavingTemplate || syncing || !canEdit} className={`px-4 py-1.5 rounded-md font-bold shadow-sm transition-all flex items-center gap-1 border bg-emerald-50 text-emerald-600 border-emerald-200 disabled:opacity-40`}>
-                {isSavingTemplate === 'saving' ? <><RefreshCw size={14} className="animate-spin" /> 保存中</> : 
-                 isSavingTemplate === 'success' ? <><Cloud size={14} /> 云端备份已保存</> :
-                 <><Cloud size={14} /> 保存云端备份</>}
-              </button>
-            </div>
-          </details>
+          {!compactSchedule && scheduleBackup}
         </header>
       )}
 
@@ -2074,17 +1995,14 @@ export default function App() {
               <Database size={64} className="text-indigo-500 mb-6" />
               <h2 className="text-2xl font-black text-slate-800 mb-3">你的课表还是空的</h2>
               <p className="text-sm font-medium text-slate-500 mb-8 leading-relaxed">
-                空课表会保持为空，不会自动载入数据。<br/>可以直接新增，也可以明确选择恢复或示例：
+                空课表不会载入示例或覆盖云端数据。<br/>可以直接新增课程，也可以恢复已有备份。
               </p>
 
               <div className="w-full flex flex-col gap-3">
                 <button onClick={restoreLatestSchedule} className="w-full py-4 bg-indigo-600 text-white font-black rounded-2xl hover:bg-indigo-700 shadow-lg shadow-indigo-200 transition-all flex items-center justify-center gap-2">
-                  <Cloud size={18} /> 1. 选择最新课表数据 (推荐)
+                  <Cloud size={18} /> 恢复最新云端备份
                 </button>
-                <button onClick={restoreInitialData} className="w-full py-4 bg-emerald-500 text-white font-black rounded-2xl hover:bg-emerald-600 shadow-lg shadow-emerald-200 transition-all flex items-center justify-center gap-2">
-                  <Calendar size={18} /> 2. 初始化数据 (固定排课)
-                </button>
-                <button onClick={() => setHideEmptyOverlay(true)} className="w-full py-4 bg-slate-100 text-slate-600 font-black rounded-2xl hover:bg-slate-200 transition-all flex items-center justify-center gap-2">
+                <button onClick={() => { setHideEmptyOverlay(true); openModal(); }} className="w-full py-4 bg-slate-100 text-slate-600 font-black rounded-2xl hover:bg-slate-200 transition-all flex items-center justify-center gap-2">
                   <Plus size={18} /> 从空白开始新增课程
                 </button>
               </div>
@@ -2096,11 +2014,32 @@ export default function App() {
           </div>
         )}
         
-        {scheduleView === 'list' ? <div ref={scheduleRef} className="max-w-3xl mx-auto space-y-3">
-          {!visibleCourses.length && <p className="text-center text-slate-500 p-8 bg-white rounded-xl">本周暂无排课</p>}
-          {DAYS.map((day, colIndex) => {
+        {scheduleView === 'list' ? <div ref={scheduleRef} aria-label="按天日程" className="max-w-3xl mx-auto space-y-3">
+          {!visibleCourses.length && !(compactSchedule && isViewingCurrentWeek) && <p className="text-center text-slate-500 p-8 bg-white rounded-xl">本周暂无排课</p>}
+          {agendaDays.map(({ day, colIndex, date, today }) => {
             const rows = visibleCourses.filter(course => course.colIndex === colIndex).sort((a, b) => a.startTime.localeCompare(b.startTime));
-            return rows.length > 0 && <section key={day} className="bg-white border border-slate-200 rounded-2xl overflow-hidden"><h2 className="px-4 py-3 bg-slate-50 text-sm font-black text-slate-600">{occurrenceDate(viewWeekId, colIndex)} {day}</h2><div className="divide-y divide-slate-100">{rows.map(course => <div key={course.id} className="flex items-center gap-3 px-4 py-3"><button disabled={!canEdit || syncing} onClick={() => openModal(course)} className="flex-1 min-w-0 text-left"><span className="block text-xs text-indigo-600 font-bold">{course.startTime}—{course.endTime}</span><span className="block font-black text-slate-800 mt-1 truncate">{course.title}</span><span className="block text-xs text-slate-500 mt-1">{['A', 'B', 'P'].includes(course.category) ? `${course.category}类` : '未分类'} · ¥{getCourseTotalValue(course, new Date(viewWeekStart.getFullYear(), viewWeekStart.getMonth(), viewWeekStart.getDate() + colIndex))}{course.notes ? ` · ${course.notes}` : ''}</span>{courseZonePreviews.get(course.id) && <span className="block text-xs text-indigo-500 mt-1">学员当地：{courseZonePreviews.get(course.id).start.date} {courseZonePreviews.get(course.id).start.time}</span>}</button><button disabled={!canEdit || syncing} onClick={() => performDelete(course.id)} aria-label={`删除课程${course.title}`} className="w-10 h-10 shrink-0 rounded-xl border border-slate-100 text-slate-400 hover:bg-red-50 hover:text-red-500 flex justify-center items-center"><X size={16} /></button></div>)}</div></section>;
+            if (!rows.length && !(compactSchedule && today)) return null;
+            return <section key={day} className={`bg-white rounded-2xl border overflow-hidden ${today ? 'border-indigo-200 shadow-sm' : 'border-slate-200'}`}>
+              <h2 className={`flex items-center gap-2 px-3 sm:px-4 py-2.5 text-sm font-black ${today ? 'bg-indigo-50 text-indigo-800' : 'bg-slate-50 text-slate-600'}`}>
+                <span>{day}</span><span className="text-xs font-semibold tabular-nums">{date}</span>
+                {today && <span className="ml-auto rounded-full bg-indigo-600 text-white px-2 py-0.5 text-[10px]">今天</span>}
+              </h2>
+              {!rows.length && <p className="px-4 py-4 text-xs text-slate-500">今天暂无排课</p>}
+              <div className="divide-y divide-slate-100">{rows.map(course => {
+                const category = TAGS[course.category] || TAGS.unclassified;
+                const zone = courseZonePreviews.get(course.id);
+                return <div key={course.id} className="flex items-center gap-2 sm:gap-3 px-3 sm:px-4 py-3">
+                  <span aria-hidden="true" className={`w-1 self-stretch shrink-0 rounded-full ${category.badge}`} />
+                  <button type="button" disabled={!canEdit || syncing} onClick={() => openModal(course)} className="flex-1 min-w-0 text-left">
+                    <span className="block text-xs text-indigo-700 font-bold tabular-nums">{course.startTime}—{course.endTime}</span>
+                    <span className="block font-black text-slate-800 mt-1 break-words">{course.title}</span>
+                    <span className="block text-xs text-slate-500 mt-1">{['A', 'B', 'P'].includes(course.category) ? `${course.category}类` : '未分类'} · ¥{getCourseTotalValue(course, parseLocalDate(date))}{course.notes ? ` · ${course.notes}` : ''}</span>
+                    {zone && <span className="block text-xs text-indigo-600 mt-1">学员当地：{zone.start.date} {zone.start.time}</span>}
+                  </button>
+                  <button type="button" disabled={!canEdit || syncing} onClick={() => performDelete(course.id)} aria-label={`删除课程${course.title}`} className="w-11 h-11 shrink-0 rounded-xl border border-slate-100 text-slate-500 hover:bg-red-50 hover:text-red-600 flex justify-center items-center"><X size={16} /></button>
+                </div>;
+              })}</div>
+            </section>;
           })}
         </div> : <div ref={scheduleRef} style={{ width: scheduleWidth, zoom: scheduleZoom / 100 }} onContextMenu={e => e.preventDefault()} className={`mx-auto bg-white flex flex-col relative border transition-colors ${isViewingCurrentWeek ? 'shadow-xl shadow-indigo-200/50 border-indigo-300 ring-4 ring-indigo-100' : 'shadow-sm border-slate-200'}`}>
           {isViewingCurrentWeek && (
@@ -2686,21 +2625,22 @@ export default function App() {
               </div>
             </div>
             <div className="flex-1 overflow-auto p-8 bg-slate-50">
-              {exportResult && exportResult.totalAll > 0 ? ['A', 'B', 'P'].map(tag => {
+              <p className="mb-4 text-xs text-slate-500">仅统计已完成课程，不含取消、停课或未结束的课程；结算金额不代表已到账。</p>
+              {exportResult?.count ? FINANCE_CATEGORIES.map(tag => {
                 const rs = exportResult.details[tag]; if (!rs.length) return null;
                 return ( <div key={tag} className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm mb-6">
                   <div className={`px-6 py-4 flex justify-between items-center ${TAGS[tag].theme.bg} border-b border-gray-200`}>
-                    <div className="font-black flex items-center gap-2 text-slate-800 text-[14px]"><span className={`px-2 py-0.5 rounded-lg shadow-sm text-[11px] ${TAGS[tag].badge}`}>{String(tag)} 级</span> 明细汇总</div>
+                    <div className="font-black flex items-center gap-2 text-slate-800 text-[14px]"><span className={`px-2 py-0.5 rounded-lg shadow-sm text-[11px] ${TAGS[tag].badge}`}>{financeCategoryLabel(tag)}</span> 明细汇总</div>
                     <div className="font-black text-indigo-700 text-[16px]">累计: ¥{String(exportResult.totals[tag])}</div>
                   </div>
                   <table className="w-full text-left text-[13px]"><thead className="bg-slate-50 text-slate-400 font-black border-b border-slate-100 text-[11px] uppercase tracking-wider"><tr><th className="px-6 py-4 font-sans">日期</th><th className="px-6 py-4 font-sans">学员 / 课程</th><th className="px-6 py-4 font-sans">上课时间</th><th className="px-6 py-4 font-sans">时长</th><th className="px-6 py-4 font-sans">备注</th><th className="px-6 py-4 text-right font-sans">结算金额</th></tr></thead>
                   <tbody className="divide-y divide-slate-50">{rs.map((r, i) => (<tr key={i} className="hover:bg-slate-50 transition-colors"><td className="px-6 py-4 text-slate-500 font-bold whitespace-nowrap">{String(r.date)}</td><td className="px-6 py-4 font-black text-slate-800">{String(r.title)}</td><td className="px-6 py-4 text-slate-500 font-bold whitespace-nowrap">{String(r.time)}</td><td className="px-6 py-4 text-slate-500 font-bold whitespace-nowrap">{String(r.duration)}</td><td className="px-6 py-4 text-slate-400 max-w-[150px] truncate" title={String(r.notes)}>{String(r.notes || '-')}</td><td className="px-6 py-4 font-black text-slate-800 text-right">¥ {String(r.value)}</td></tr>))}</tbody></table>
                 </div> );
-              }) : <div className="text-center text-slate-400 py-20 font-black flex flex-col items-center gap-3"><FileSpreadsheet size={40} className="opacity-20"/>{exportResult ? '所选周期内没有排课数据' : '请选择结算周期并点击“统计计算”按钮'}</div>}
+              }) : <div className="text-center text-slate-400 py-20 font-black flex flex-col items-center gap-3"><FileSpreadsheet size={40} className="opacity-20"/>{exportResult ? '所选日期范围内暂无已完成课程' : exportRange.start && exportRange.end && exportRange.start > exportRange.end ? '开始日期不能晚于结束日期' : '请选择有效的开始日期和结束日期'}</div>}
             </div>
             <div className="px-8 py-5 border-t border-slate-100 flex justify-end gap-3 shrink-0">
               <button onClick={() => setIsExportModalOpen(false)} className="px-6 py-2.5 rounded-2xl text-slate-500 font-black hover:bg-slate-100 transition-all font-sans">返回关闭</button>
-              <button onClick={downloadCSV} disabled={!exportResult || exportResult.totalAll === 0} className={`px-8 py-2.5 rounded-2xl font-black transition-all flex items-center gap-2 ${exportResult && exportResult.totalAll > 0 ? 'bg-slate-800 text-white hover:bg-black shadow-lg' : 'bg-slate-100 text-slate-300 cursor-not-allowed'} font-sans`}><Download size={16}/>下载 Excel 表格</button>
+              <button onClick={downloadCSV} disabled={!exportResult?.count} className={`px-8 py-2.5 rounded-2xl font-black transition-all flex items-center gap-2 ${exportResult?.count ? 'bg-slate-800 text-white hover:bg-black shadow-lg' : 'bg-slate-100 text-slate-300 cursor-not-allowed'} font-sans`}><Download size={16}/>下载 CSV 表格</button>
             </div>
           </div>
         </div>

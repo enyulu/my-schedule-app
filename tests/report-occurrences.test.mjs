@@ -2,6 +2,8 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { buildFinanceExport } from '../src/financeExport.js';
+import { filterKnownOccurrences } from '../src/monthlyReports.js';
 const source = readFileSync(new URL('../src/App.jsx', import.meta.url), 'utf8');
 const context = vm.createContext({ Date, TAGS: { A: {}, B: {}, P: {} }, COURSE_TIME_PATTERN: /^([01]\d|2[0-3]):([0-5]\d)$/ });
 vm.runInContext(source.slice(source.indexOf('const getMonday ='), source.indexOf('// --- Gemini API'))
@@ -31,4 +33,19 @@ test('report opt-in includes future and cross-month scheduled courses, default s
 test('report forecast continues to exclude cancelled and explicitly incomplete courses', () => {
   const result = collect([{ ...base, status: 'cancelled' }, { ...base, completed: false }], { start: '2026-10-01', end: '2026-10-31' }, new Date(2026, 9, 31), { includeUnfinished: true });
   assert.equal(result.length, 0);
+});
+
+test('financial export counts a completed overnight lesson by its start date even when it ends after the selected range', () => {
+  const course = { ...base, colIndex: 5, startTime: '23:00', endTime: '00:30' };
+  const start = source.indexOf('  const exportResult = useMemo');
+  const calculation = source.slice(start, source.indexOf('  const saveSnapshotForUndo', start));
+  Object.assign(context, {
+    courses: [course], statisticsCourses: [course], isExportModalOpen: true, exportCourseFilter: '',
+    exportRange: { start: '2026-10-01', end: '2026-10-31' }, statisticsNow: new Date(2026, 10, 2),
+    useMemo: fn => fn(), buildFinanceExport, filterKnownOccurrences, getCourseDisplayInfo: row => ({ title: row.title }),
+  });
+  const result = vm.runInContext(`${calculation}\nexportResult;`, context);
+  assert.equal(result.count, 1);
+  assert.equal(result.details.P[0].date, '2026-10-31');
+  assert.equal(result.totalAll, 600);
 });

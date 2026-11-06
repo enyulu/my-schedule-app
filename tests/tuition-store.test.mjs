@@ -19,6 +19,26 @@ const fixture = () => {
   return { store, records, listeners, sdk, setFail: value => { fail = value; }, deactivate: () => { active = false; } };
 };
 const accountChange = { collection: 'tuition_accounts', id: 'one', expectedVersion: 0, data: { studentName: 'Nina', subject: 'Math', category: 'A', startsAt: 1, reminderMinutes: 120 } };
+test('course-only recovery cannot change or remove an active package-bound lesson', async () => {
+  const f = fixture(), root = 'artifacts/stable-schedule-private-v999/users/A/';
+  const course = { id: 'c', title: 'Nina', category: 'A', colIndex: 2, startTime: '09:00', endTime: '10:00' };
+  const account = { ...accountChange.data, id: 'one', version: 1 };
+  const binding = { id: 'c', courseId: 'c', version: 1, segments: [{ fromKey: '2026-11-04|09:00', toKey: null, accountId: 'one' }] };
+  f.records.set(root + 'courses/c', course); f.records.set(root + 'tuition_accounts/one', account);
+  f.records.set(root + 'tuition_bindings/c', binding); f.records.set(root + 'app_state/tuition_manifest', { courseIds: ['c'], version: 1 });
+  const make = () => createCourseWriteBatch({ db: {}, appId: 'stable-schedule-private-v999', userId: 'A', isCurrentUser: () => true, sdk: f.sdk, beforeCourses: [course], tuitionState: { status: 'ready', accounts: [account], bindings: [binding] } });
+  for (const replacement of [{ ...course, colIndex: 0 }, null]) {
+    const batch = make(); batch.markRecovery();
+    batch.set(root + 'app_state/pre_restore_backup', { courses: [course] });
+    if (replacement) batch.set(root + 'courses/c', replacement); else batch.delete(root + 'courses/c');
+    await assert.rejects(batch.commit(), /课包关联.*恢复/);
+    assert.equal(f.records.get(root + 'courses/c'), course);
+    assert.equal(f.records.has(root + 'app_state/pre_restore_backup'), false);
+  }
+  const unchanged = make(); unchanged.markRecovery(); unchanged.set(root + 'courses/c', { ...course });
+  await unchanged.commit();
+  assert.deepEqual(f.records.get(root + 'courses/c'), course);
+});
 test('new record and audit commit together under the fixed private user namespace', async () => {
   const { store, records } = fixture();
   await store.commit({ changes: [accountChange], audit: { action: 'create' } });

@@ -38,7 +38,7 @@ test('report forecast continues to exclude cancelled and explicitly incomplete c
 test('financial export counts a completed overnight lesson by its start date even when it ends after the selected range', () => {
   const course = { ...base, colIndex: 5, startTime: '23:00', endTime: '00:30' };
   const start = source.indexOf('  const exportResult = useMemo');
-  const calculation = source.slice(start, source.indexOf('  const saveSnapshotForUndo', start));
+  const calculation = source.slice(start, source.indexOf('  const applyCourseBindings', start));
   Object.assign(context, {
     courses: [course], statisticsCourses: [course], isExportModalOpen: true, exportCourseFilter: '',
     exportRange: { start: '2026-10-01', end: '2026-10-31' }, statisticsNow: new Date(2026, 10, 2),

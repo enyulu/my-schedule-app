@@ -1,5 +1,6 @@
 import * as firestore from 'firebase/firestore';
 import { planBindingMutation } from './tuitionPackages.js';
+import { sameCourseRecord, sameBindingContent } from './courseReceipts.js';
 
 export const TUITION_COLLECTIONS = ['tuition_accounts', 'tuition_packages', 'tuition_bindings', 'tuition_adjustments', 'tuition_audit'];
 const names = ['accounts', 'packages', 'bindings', 'adjustments', 'audit'];
@@ -84,7 +85,7 @@ const canonical = value => JSON.stringify(value, (_, item) => item && typeof ite
 // One transaction owns course writes, association version checks and audit. Rendering never writes.
 export const createCourseWriteBatch = ({ db, appId, userId, isCurrentUser, beforeCourses, tuitionState, normalizeCourse = row => row, confirmImpact = () => true, onApplied = () => {}, sdk = firestore }) => {
   const root = `artifacts/${appId}/users/${userId}/`, ops = [], inheritances = [], selections = [], overrides = [], relocations = [];
-  let recovery = false;
+  let recovery = false, undoExpectation = null;
   if (appId !== 'stable-schedule-private-v999' || !safeId(userId)) throw Error('课程用户命名空间无效');
   const ref = (collection, id) => sdk.doc(db, 'artifacts', appId, 'users', userId, collection, id);
   const before = new Map(beforeCourses.map(row => [row.id, row]));
@@ -97,9 +98,10 @@ export const createCourseWriteBatch = ({ db, appId, userId, isCurrentUser, befor
     markRecovery: () => { recovery = true; },
     bindCourse: (courseId, fromKey, accountId) => selections.push({ courseId, fromKey, accountId }),
     restoreBindings: rows => overrides.push(...rows),
+    expectUndo: receipt => { undoExpectation = receipt; },
     commit: async () => {
       if (!isCurrentUser()) throw Error('账号已改变，已取消课程保存');
-      if (!ops.length || ops.length > 400) throw Error('课程修改数量超过安全限制');
+      if ((!ops.length && !overrides.length) || ops.length > 400) throw Error('课程修改数量超过安全限制');
       if (ops.some(op => !pathOf(op.target)?.startsWith(root))) throw Error('拒绝跨用户修改课程');
       const after = new Map(before);
       const courseOps = ops.filter(op => pathOf(op.target).startsWith(`${root}courses/`) && !pathOf(op.target).endsWith('/_metadata_'));
@@ -127,11 +129,12 @@ export const createCourseWriteBatch = ({ db, appId, userId, isCurrentUser, befor
       if (hasImpact && tuitionState.status !== 'ready') throw Error('课包关联状态尚未确认，已保留课程草稿，请联网重试');
       if (hasImpact && !await confirmImpact(plan)) throw Error('已取消操作，课程与课包均未修改');
       const now = Date.now();
+      let receipt;
       await sdk.runTransaction(db, async transaction => {
         // Start independent reads together. Keep every read inside this transaction
         // (and rebuild on retries), so faster saves retain conflict protection.
         const manifestRef = ref('app_state', 'tuition_manifest');
-        const checkedBindings = new Set([...plan.bindingChanges.map(change => change.id), ...inheritances.map(row => row.fromId), ...relocations.map(row => row.fromId), ...(tuitionState.bindings || []).filter(row => touched.has(row.courseId)).map(row => row.courseId)]);
+        const checkedBindings = new Set([...plan.bindingChanges.map(change => change.id), ...inheritances.map(row => row.fromId), ...relocations.map(row => row.fromId), ...(tuitionState.bindings || []).filter(row => touched.has(row.courseId)).map(row => row.courseId), ...(undoExpectation?.bindingGuards || []).map(row => row.id)]);
         const bindingIds = [...checkedBindings];
         const [manifestSnap, currentCourses, initialBindings, selectedAccounts] = await Promise.all([
           transaction.get(manifestRef),
@@ -141,22 +144,32 @@ export const createCourseWriteBatch = ({ db, appId, userId, isCurrentUser, befor
         ]);
         const manifest = manifestSnap.exists() ? manifestSnap.data() : { courseIds: [], version: 0 };
         if (manifest.courseIds?.some(id => touched.has(id) || inheritances.some(row => row.fromId === id) || relocations.some(row => row.fromId === id)) && tuitionState.status !== 'ready') throw Error('课包关联状态无法读取，请先恢复连接再修改这门课');
+        const serverBefore = new Map();
         currentCourses.forEach((snapshot, index) => {
           const id = pathOf(courseOps[index].target).split('/').at(-1), previous = before.get(id);
+          if (snapshot.exists()) serverBefore.set(id, { ...snapshot.data(), id });
           if (previous && !snapshot.exists() || !previous && snapshot.exists()) throw Error('课程记录已被修改，请刷新后重试');
           if (previous && canonical(normalizeCourse({ ...snapshot.data(), id })) !== canonical(normalizeCourse(previous))) throw Error('课程记录已被修改，请刷新后重试');
         });
+        for (const change of undoExpectation?.courseChanges || []) {
+          if (!touched.has(change.id) || !sameCourseRecord(serverBefore.get(change.id), change.after)) throw Error('课程已有后续修改，无法安全撤销');
+        }
         // Another device may have linked a course since the local snapshots.
         // Read server-discovered bindings rather than trusting a local fast path.
         const discoveredIds = [...new Set(manifest.courseIds || [])].filter(id => touched.has(id) && !checkedBindings.has(id));
         const discoveredBindings = discoveredIds.length ? await Promise.all(discoveredIds.map(id => transaction.get(ref('tuition_bindings', id)))) : [];
         discoveredIds.forEach(id => { bindingIds.push(id); checkedBindings.add(id); });
         const currentBindings = [...initialBindings, ...discoveredBindings];
+        const serverBindings = new Map();
         currentBindings.forEach((snapshot, index) => {
+          if (snapshot.exists()) serverBindings.set(bindingIds[index], { ...snapshot.data(), id: bindingIds[index] });
           const original = tuitionState.bindings?.find(binding => binding.courseId === bindingIds[index]);
           if ((snapshot.exists() ? snapshot.data().version : 0) !== (original?.version || 0)) throw Error('课包关联已被修改，请刷新后重试');
           if (recovery && snapshot.exists()) assertRecoverySafe({ ...snapshot.data(), courseId: bindingIds[index] });
         });
+        for (const change of undoExpectation?.bindingGuards || undoExpectation?.bindingReceipts || []) {
+          if (!sameBindingContent(serverBindings.get(change.id), change.after)) throw Error('课包关联已有后续修改，无法安全撤销');
+        }
         selectedAccounts.forEach((snapshot, index) => {
           if (!snapshot.exists()) throw Error('关联的课包账户不存在');
           const expected = tuitionState.accounts.find(row => row.id === plan.affectedAccountIds[index]);
@@ -164,13 +177,27 @@ export const createCourseWriteBatch = ({ db, appId, userId, isCurrentUser, befor
         });
         if (!isCurrentUser()) throw Error('账号已改变，已取消课程保存');
         ops.forEach(op => { if (op.method === 'delete') transaction.delete(op.target); else transaction[op.method](op.target, op.data); });
-        plan.bindingChanges.forEach(change => transaction.set(ref(change.collection, change.id), { ...change.data, version: change.expectedVersion + 1, createdAt: change.data.createdAt || now, updatedAt: now }));
+        const bindingReceipts = plan.bindingChanges.map(change => ({ id: change.id, before: serverBindings.get(change.id) || null,
+          after: { ...change.data, version: change.expectedVersion + 1, createdAt: change.data.createdAt || now, updatedAt: now } }));
+        bindingReceipts.forEach(change => transaction.set(ref('tuition_bindings', change.id), change.after));
+        const serverAfter = new Map(serverBefore);
+        for (const op of courseOps) {
+          const id = pathOf(op.target).split('/').at(-1);
+          if (op.method === 'delete') serverAfter.delete(id);
+          else serverAfter.set(id, { ...(op.method === 'update' ? serverAfter.get(id) : {}), ...op.data, id });
+        }
+        const courseChanges = [...touched].map(id => ({ id, before: serverBefore.get(id) || null, after: serverAfter.get(id) || null }))
+          .filter(change => !sameCourseRecord(change.before, change.after));
+        const bindingAfter = new Map(bindingReceipts.map(({ id, after }) => [id, after]));
+        const bindingGuards = [...new Set([...courseChanges.map(row => row.id), ...bindingAfter.keys()])]
+          .map(id => ({ id, after: bindingAfter.get(id) || serverBindings.get(id) || null }));
+        receipt = { courseChanges, bindingReceipts, bindingGuards };
         if (hasImpact) {
           transaction.set(ref('tuition_audit', crypto.randomUUID()), { action: recovery ? '课表恢复／请核对余额' : '排课变更／重新核算', accountIds: plan.affectedAccountIds, before: beforeCourses.filter(row => touched.has(row.id)), after: [...after.values()].filter(row => touched.has(row.id)), bindingBefore: tuitionState.bindings.filter(row => checkedBindings.has(row.courseId)), bindingAfter: plan.bindingChanges.map(row => row.data), createdAt: now, version: 1 });
           transaction.set(manifestRef, { enabled: true, courseIds: [...new Set([...(manifest.courseIds || []), ...plan.bindingChanges.map(row => row.id)])], version: (manifest.version || 0) + 1, updatedAt: now });
         }
       });
-      if (isCurrentUser()) onApplied(plan);
+      if (isCurrentUser()) onApplied({ ...plan, ...receipt });
     },
   };
   return api;

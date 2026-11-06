@@ -9,6 +9,7 @@ import TuitionBinding from './TuitionBinding.jsx';
 import AndyCounter, { AndyStatistics } from './AndyCounter.jsx';
 import useAndyCounter from './useAndyCounter.js';
 import { createCourseWriteBatch } from './tuitionStore.js';
+import { applyCourseReceipt, reconcileCourseSnapshot, stageCourseUndo, sharesCoursePriceScope } from './courseReceipts.js';
 import { bindingAccountAt, calculateTuition, collectTuitionOccurrences, tuitionHours, tuitionStartDate } from './tuitionPackages.js';
 import { filterKnownOccurrences } from './monthlyReports.js';
 import { buildFinanceExport, createFinanceCsv, FINANCE_CATEGORIES, financeCategoryLabel } from './financeExport.js';
@@ -19,7 +20,7 @@ import { BEIJING_ZONE, occurrenceDate, convertBeijingLesson, beijingPlacement } 
 import { Calendar, ChevronLeft, ChevronRight, ChevronDown, Plus, X, Clock, AlertCircle, Download, RefreshCw, Cloud, Copy, FileSpreadsheet, BarChart3, Globe2, Layers, Settings2, Undo, Database, AlignLeft, Sparkles, Bot, Maximize2, Minimize2, LogOut, Lock, Mail } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
 import { getAuth, signInWithCustomToken, signInAnonymously, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword, signOut } from 'firebase/auth';
-import { getFirestore, collection, doc, setDoc, onSnapshot, writeBatch, getDocs, getDoc } from 'firebase/firestore';
+import { getFirestore, collection, doc, setDoc, onSnapshot, writeBatch, getDocs, getDoc, getDocFromServer } from 'firebase/firestore';
 
 // ============================================================================
 // ⚠️ 独立网站部署必填配置 (如果您要将其部署到自己的服务器/IP上)
@@ -496,6 +497,12 @@ export default function App() {
   const saveInFlightRef = useRef(false);
   const activeUserIdRef = useRef(null);
   const [statisticsSource, setStatisticsSource] = useState(null);
+  const courseRowsRef = useRef([]), confirmedCoursesRef = useRef(new Map());
+  const publishCourseRows = useCallback(rows => {
+    const normalized = normalizeCourseDataset(rows, 'course-view', currentWeekId);
+    courseRowsRef.current = rows;
+    setCourses(normalized); setStatisticsSource(rows);
+  }, []);
   const [statisticsNow, setStatisticsNow] = useState(() => new Date());
   const [isStatisticsOpen, setIsStatisticsOpen] = useState(false);
   const [isReportsOpen, setIsReportsOpen] = useState(false);
@@ -638,7 +645,6 @@ export default function App() {
   const [backupText, setBackupText] = useState("");
   const [backupStatus, setBackupStatus] = useState("");
   const [undoStack, setUndoStack] = useState([]);
-  const pendingUndoRef = useRef(null);
   const [isSavingTemplate, setIsSavingTemplate] = useState(false);
 
   const [isAIModalOpen, setIsAIModalOpen] = useState(false);
@@ -728,11 +734,12 @@ export default function App() {
             setIsNameManagerOpen(false); setIsTitleDropdownOpen(false);
             setIsStatisticsOpen(false); setIsReportsOpen(false); setIsExportModalOpen(false);
             setIsTuitionOpen(false);
-            setIsTuitionBindingOpen(false); pendingUndoRef.current = null;
+            setIsTuitionBindingOpen(false);
             setIsAIModalOpen(false); setScheduleAnalysisResult('');
             setZoneConverter(null); setMoveConfirmInfo(null); setDragInfo(null);
             setCourseCelebration(null); setRestoreError(''); setOverlapState({});
           }
+          courseRowsRef.current = []; confirmedCoursesRef.current.clear();
           setUser(u); setCourses([]); setStatisticsSource(null);
           setDataState('loading'); setLoadError(''); setAuthError('');
           setAuthInitialized(true);
@@ -740,6 +747,7 @@ export default function App() {
       } catch (error) {
         if (!active) return;
         console.error(error);
+        activeUserIdRef.current = null; courseRowsRef.current = []; confirmedCoursesRef.current.clear();
         setUser(null); setCourses([]); setStatisticsSource(null);
         setAuthError('认证连接失败，请重试或重新登录；未切换到其他用户。');
         setAuthInitialized(true);
@@ -762,9 +770,21 @@ export default function App() {
       }
       try {
         // Loading is strictly read-only, including empty accounts and legacy records.
-        const list = normalizeCourseDataset(rawCourses, 'firestore-snapshot', currentWeekId);
-        setCourses(list);
-        setStatisticsSource(rawCourses);
+        const pending = confirmedCoursesRef.current;
+        const { rows, verify } = reconcileCourseSnapshot(rawCourses, pending, !snap.metadata?.fromCache && !snap.metadata?.hasPendingWrites);
+        publishCourseRows(rows);
+        // A matching older snapshot can also be another device reverting the edit.
+        // Read that document from the server rather than guessing or refreshing the page.
+        for (const id of verify) {
+          const entry = pending.get(id);
+          entry.checking = true;
+          getDocFromServer(doc(getCoursesRef(user.uid), id)).then(snapshot => {
+            if (!active || activeUserIdRef.current !== user.uid || pending.get(id) !== entry) return;
+            const next = new Map(courseRowsRef.current.map(row => [row.id, row]));
+            if (snapshot.exists()) next.set(id, { ...snapshot.data(), id }); else next.delete(id);
+            publishCourseRows([...next.values()]); pending.delete(id);
+          }).catch(error => { entry.checking = false; if (active) logFirestoreError('course:verify-display', error); });
+        }
         setDataState(snap.metadata?.fromCache ? 'cached' : 'ready');
         setLoadError('');
         setHideEmptyOverlay(false);
@@ -780,7 +800,7 @@ export default function App() {
       setLoadError('无法读取云端课表，已保留当前显示内容。请检查网络或权限后重试，暂不可编辑。');
     });
     return () => { active = false; unsubscribe(); };
-  }, [user, loadAttempt]);
+  }, [user, loadAttempt, publishCourseRows]);
 
   const coursesRefLatest = useRef(courses);
   useEffect(() => { coursesRefLatest.current = courses; }, [courses]);
@@ -994,10 +1014,8 @@ export default function App() {
     });
   }, [isExportModalOpen, exportRange, exportCourseFilter, courses, statisticsCourses, statisticsNow, getCourseDisplayInfo]);
 
-  const saveSnapshotForUndo = useCallback(() => { pendingUndoRef.current = { courses: JSON.parse(JSON.stringify(coursesRefLatest.current)), bindings: JSON.parse(JSON.stringify(tuition.state.bindings)) }; }, [tuition.state.bindings]);
-
-  const courseWriteBatch = useCallback(() => {
-    const undo = pendingUndoRef.current; pendingUndoRef.current = null;
+  const applyCourseBindings = tuition.applyCourseBindings;
+  const courseWriteBatch = useCallback((recordUndo = true) => {
     return createCourseWriteBatch({ db, appId: FIXED_APP_ID, userId: user.uid, isCurrentUser: () => activeUserIdRef.current === user.uid, beforeCourses: courses, tuitionState: tuition.state, normalizeCourse,
       confirmImpact: plan => {
         const nextBindings = [...tuition.state.bindings.filter(row => !plan.bindingChanges.some(change => change.id === row.id)), ...plan.bindingChanges.map(change => change.data)];
@@ -1009,9 +1027,21 @@ export default function App() {
         });
         return window.confirm(`此操作会重新核算相关课包，并保留操作记录：\n${lines.join('\n')}\n确认继续？`);
       },
-      onApplied: plan => { if (undo) setUndoStack(previous => [...previous, { ...undo, afterBindingVersions: Object.fromEntries(plan.bindingChanges.map(change => [change.id, change.expectedVersion + 1])) }]); },
+      onApplied: ({ courseChanges, bindingReceipts, bindingGuards }) => {
+        if (recordUndo && (courseChanges.length || bindingReceipts.length)) {
+          setUndoStack(previous => [...previous, { courseChanges, bindingReceipts, bindingGuards }]);
+        }
+        applyCourseBindings(user.uid, bindingReceipts);
+        if (!courseChanges.length) return;
+        try {
+          publishCourseRows(applyCourseReceipt(courseRowsRef.current, confirmedCoursesRef.current, courseChanges));
+        } catch (error) {
+          logFirestoreError('course:confirmed-display', error);
+          setRestoreError('课程已保存，但界面暂未同步，请重新读取课表；无需重复保存。');
+        }
+      },
     });
-  }, [courses, tuition.state, tuition.results, user]);
+  }, [courses, tuition.state, tuition.results, user, applyCourseBindings, publishCourseRows]);
 
   const getDraftTuitionAccount = () => {
     if (formData.pendingTuitionChanged) return formData.pendingTuitionAccountId || '';
@@ -1027,16 +1057,10 @@ export default function App() {
     saveInFlightRef.current = true; setRestoreError(''); setSyncing(true);
     try {
       const entry = undoStack[undoStack.length - 1];
-      const previousCourses = entry.courses;
-      for (const [id, version] of Object.entries(entry.afterBindingVersions || {})) {
-        if (tuition.state.bindings.find(row => row.id === id)?.version !== version) throw Error('课包关联已有后续修改，不能覆盖撤销，请先核对记录');
-      }
-      const batch = courseWriteBatch();
-      batch.restoreBindings(Object.keys(entry.afterBindingVersions || {}).map(id => entry.bindings.find(row => row.id === id) || { id, courseId: id, segments: [], sourceDeleted: true }));
-      courses.forEach(c => { if (!previousCourses.find(pc => pc.id === c.id)) batch.delete(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', c.id)); });
-      previousCourses.forEach(c => batch.set(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', c.id), c));
+      const batch = courseWriteBatch(false);
+      stageCourseUndo(batch, entry, courseRowsRef.current, tuition.state.bindings, id => doc(getCoursesRef(user.uid), id));
       await batch.commit();
-      setUndoStack(prev => prev.slice(0, -1));
+      if (activeUserIdRef.current === user.uid) setUndoStack(prev => prev.at(-1) === entry ? prev.slice(0, -1) : prev);
     } catch (e) { console.error(e); setRestoreError(`撤销未完成：${e.message}`); } finally { saveInFlightRef.current = false; setSyncing(false); }
   };
 
@@ -1099,7 +1123,7 @@ export default function App() {
                setMoveConfirmInfo({ course, newColIdx: colIdx, newStartTime, newEndTime });
                setDragInfo(null); return; 
             }
-            saveInFlightRef.current = true; setRestoreError(''); saveSnapshotForUndo(); setSyncing(true);
+            saveInFlightRef.current = true; setRestoreError(''); setSyncing(true);
             try {
               const batch = courseWriteBatch();
               batch.update(doc(db, `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${course.id}`), {
@@ -1119,7 +1143,7 @@ export default function App() {
               setSyncing(false);
             }
          } else if (action === 'copy') {
-            saveInFlightRef.current = true; setRestoreError(''); saveSnapshotForUndo(); setSyncing(true);
+            saveInFlightRef.current = true; setRestoreError(''); setSyncing(true);
             try {
                const newId = Math.random().toString(36).substr(2, 9);
                const newData = { ...course, id: newId, colIndex: colIdx, weekday: colIdx, startTime: newStartTime, endTime: newEndTime };
@@ -1143,12 +1167,12 @@ export default function App() {
     window.addEventListener('mousemove', handleMouseMove);
     window.addEventListener('mouseup', handleMouseUp);
     return () => { window.removeEventListener('mousemove', handleMouseMove); window.removeEventListener('mouseup', handleMouseUp); };
-  }, [dragInfo, viewWeekId, user, openModal, canEdit, syncing, courseWriteBatch, saveSnapshotForUndo]);
+  }, [dragInfo, viewWeekId, user, openModal, canEdit, syncing, courseWriteBatch]);
 
   const handleConfirmMove = async (type) => {
     if (!moveConfirmInfo || !user || !canEdit || syncing || saveInFlightRef.current) return;
     saveInFlightRef.current = true; setRestoreError('');
-    saveSnapshotForUndo(); setSyncing(true);
+    setSyncing(true);
     const { course, newColIdx, newStartTime, newEndTime } = moveConfirmInfo;
     try {
       const batch = courseWriteBatch();
@@ -1227,11 +1251,10 @@ export default function App() {
       const rawCourses = Array.isArray(backupData.courses) ? backupData.courses : JSON.parse(backupData.code || 'null');
       const validatedCourses = normalizeCourseDataset(rawCourses, 'latest-backup', viewWeekId);
       if (!window.confirm(`确认用备份的${validatedCourses.length}条课程替换当前课表？当前云端记录会先原子保存为恢复前副本。`)) return;
-      saveSnapshotForUndo();
       if (activeUserIdRef.current !== user.uid) return;
-      const restored = await replaceFirestoreSchedule(user.uid, validatedCourses, 'latest-backup', viewWeekId, () => activeUserIdRef.current === user.uid, courseWriteBatch);
+      await replaceFirestoreSchedule(user.uid, validatedCourses, 'latest-backup', viewWeekId, () => activeUserIdRef.current === user.uid, courseWriteBatch);
       if (activeUserIdRef.current !== user.uid) return;
-      setCourses(restored); setHideEmptyOverlay(true);
+      setHideEmptyOverlay(true);
     } catch (error) {
       logFirestoreError('restore:latest-backup', error);
       setRestoreError(`恢复未完成，原课表保持不变：${error.message}`);
@@ -1255,9 +1278,8 @@ export default function App() {
       const parsed = JSON.parse(backupText);
       const validatedCourses = normalizeCourseDataset(parsed, 'manual-import', viewWeekId);
       if (!window.confirm(`确认用导入的${validatedCourses.length}条课程替换当前课表？原记录将先保存恢复前副本。`)) return;
-      saveSnapshotForUndo();
       setSyncing(true);
-      const restoredCourses = await replaceFirestoreSchedule(
+      await replaceFirestoreSchedule(
         user.uid,
         validatedCourses,
         'manual-import',
@@ -1266,7 +1288,6 @@ export default function App() {
         courseWriteBatch,
       );
       if (activeUserIdRef.current !== user.uid) return;
-      setCourses(restoredCourses);
       setBackupStatus('✅ 数据已成功恢复！');
       setTimeout(() => { if (activeUserIdRef.current !== user.uid) return; setIsBackupModalOpen(false); setBackupStatus(''); setHideEmptyOverlay(true); }, 1500);
     } catch (error) {
@@ -1344,7 +1365,7 @@ export default function App() {
     if (!COURSE_TIME_PATTERN.test(formData.startTime) || !Number.isFinite(Number(formData.duration)) || Number(formData.duration) <= 0 || Number(formData.duration) > 1440) { setRestoreError('请选择有效的开始时间和不超过24小时的课程时长。'); return; }
     saveInFlightRef.current = true;
     setRestoreError('');
-    saveSnapshotForUndo(); setSyncing(true);
+    setSyncing(true);
     const original = editingCourseId ? courses.find(c => c.id === editingCourseId) : null;
     const targetId = (isDuplicate || !editingCourseId) ? Math.random().toString(36).substr(2, 9) : editingCourseId;
     const data = { ...formData, id: targetId, endTime: minutesToTime(timeToMinutes(formData.startTime) + Number(formData.duration)) };
@@ -1382,6 +1403,11 @@ export default function App() {
       if (isDuplicate && formData.pendingTuitionAccountId && !window.confirm('复制的是一堂新课程，确认也关联当前选定课包？')) throw Error('已取消复制，未修改课程或课包');
       batch.bindCourse(id, `${occurrenceDate(week, Number(course.colIndex))}|${course.startTime}`, formData.pendingTuitionAccountId || null);
     };
+    const relocateTemporaryBinding = (batch, id) => {
+      if (isDuplicate || !original || original.isFixed || data.isFixed) return;
+      if (original.startTime === data.startTime && Number(original.colIndex) === Number(data.colIndex) && original.weekId === data.weekId) return;
+      batch.relocateBinding(original.id, id, `${occurrenceDate(original.weekId, Number(original.colIndex))}|${original.startTime}`, `${occurrenceDate(data.weekId, Number(data.colIndex))}|${data.startTime}`, false);
+    };
 
     try {
       const priceChanged = original && Number(original.value) !== Number(data.value);
@@ -1404,9 +1430,9 @@ export default function App() {
 
       if (shouldApplyPriceFromCurrentCourse || shouldPreserveCategoryHistory || shouldPreserveScheduleHistory) {
         const batch = courseWriteBatch();
-        // 调价沿用同名课程的未来计价规则；类别只改变当前选中的循环课程。
+        // Only a known learner identity can extend a price change to another series.
         const affectedCourses = shouldApplyPriceFromCurrentCourse
-          ? courses.filter(course => course.title === original.title)
+          ? courses.filter(course => sharesCoursePriceScope(original, course))
           : [original];
 
         affectedCourses.forEach(course => {
@@ -1424,6 +1450,7 @@ export default function App() {
             if (occurrenceKey < priceEffectiveOccurrence) return;
             if (course.id === original.id) {
               batch.set(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', course.id), normalizeCourse(data, 0, viewWeekId));
+              relocateTemporaryBinding(batch, course.id);
               applyTuitionSelection(batch, course.id);
             } else {
               batch.update(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', course.id), {
@@ -1519,7 +1546,7 @@ export default function App() {
       });
       const batch = courseWriteBatch();
       batch.set(doc(db, `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${targetId}`), validatedCourse);
-      if (!isDuplicate && original && !original.isFixed && (original.startTime !== data.startTime || Number(original.colIndex) !== Number(data.colIndex))) batch.relocateBinding(original.id, targetId, `${occurrenceDate(original.weekId, Number(original.colIndex))}|${original.startTime}`, `${occurrenceDate(data.weekId, Number(data.colIndex))}|${data.startTime}`, false);
+      relocateTemporaryBinding(batch, targetId);
       applyTuitionSelection(batch, targetId);
       if (typeof formData.pendingLessonTrackingEnabled === 'boolean') {
         courses.filter(course => course.title === data.title && course.id !== targetId).forEach(course => {
@@ -1549,7 +1576,7 @@ export default function App() {
     const c = courses.find(item => item.id === id); if (!c || !user || !canEdit || saveInFlightRef.current || syncing) return;
     if (!window.confirm(c.isFixed ? force ? `确认从本周结束“${c.title}”的固定排课？` : `确认取消“${c.title}”本周的这一节课？其他周不变。` : `确认删除“${c.title}”这节临时课程？`)) return;
     saveInFlightRef.current = true; setRestoreError('');
-    saveSnapshotForUndo(); setSyncing(true);
+    setSyncing(true);
     const path = `artifacts/${FIXED_APP_ID}/users/${user.uid}/courses/${id}`;
     
     try {
@@ -1584,7 +1611,7 @@ export default function App() {
     const name = event.currentTarget.dataset.courseName;
     if (!user || !canEdit || syncing || saveInFlightRef.current) return;
     if (deleteConfirmTitle !== name) { setDeleteConfirmTitle(name); return; }
-    saveInFlightRef.current = true; saveSnapshotForUndo(); setSyncing(true);
+    saveInFlightRef.current = true; setSyncing(true);
     try {
       const batch = courseWriteBatch();
       courses.filter(course => course.title === name).forEach(course => batch.delete(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', course.id)));
@@ -1601,7 +1628,7 @@ export default function App() {
     const oldName = event.currentTarget.dataset.courseName, newName = editingNameState.newName;
     if (!user || !canEdit || syncing || saveInFlightRef.current) return;
     const finalNewName = newName.trim(); if (!finalNewName || oldName === finalNewName) { setEditingNameState({ oldName: null, newName: '' }); return; }
-    saveInFlightRef.current = true; saveSnapshotForUndo(); setSyncing(true);
+    saveInFlightRef.current = true; setSyncing(true);
     try {
       const batch = courseWriteBatch();
       courses.filter(course => course.title === oldName).forEach(course => {
@@ -1668,7 +1695,6 @@ export default function App() {
     const nextAnchors = Array.from(anchorMap.values())
       .sort((a, b) => getLessonAnchorKey(a).localeCompare(getLessonAnchorKey(b)));
 
-    saveSnapshotForUndo();
     setSyncing(true);
     try {
       const batch = courseWriteBatch();
@@ -1811,6 +1837,9 @@ export default function App() {
       {compactSchedule && restoreError && <p role="alert" className="mt-2 text-xs text-red-700">{restoreError}</p>}
     </details>
   );
+  const undoButton = <button type="button" onClick={handleUndo} disabled={!undoStack.length || syncing || !canEdit}
+    className={`shrink-0 inline-flex items-center gap-1.5 h-11 md:h-auto px-2.5 md:px-3 md:py-2 rounded-xl border text-xs font-bold text-slate-600 bg-white hover:bg-indigo-50 disabled:opacity-40 disabled:cursor-not-allowed ${compactSchedule ? 'ml-auto' : ''}`}
+    title="只撤销上一次课表操作"><Undo size={16} />撤销</button>;
   // --- 主界面 ---
   return (
     <div ref={appContainerRef} className={`flex flex-col text-slate-800 font-sans text-[13px] transition-all duration-300 ${isCssFullscreen ? 'fixed inset-0 z-[9999] w-screen h-screen m-0 p-0 overflow-hidden bg-white' : 'h-[100dvh] bg-white'}`}>
@@ -1862,7 +1891,7 @@ export default function App() {
       {!isZenMode && (
         <header className="flex-shrink-0 bg-white z-30 flex flex-col shadow-sm relative">
           <div className="px-3 md:px-6 py-2.5 md:py-4 flex flex-wrap gap-2 md:gap-4 items-center justify-between border-b border-slate-100">
-            <div className="flex items-center gap-2.5 md:gap-4 min-w-0">
+            <div className="flex items-center gap-2.5 md:gap-4 min-w-0 w-full md:w-auto">
               <div className="bg-slate-800 p-2 text-white rounded-xl shadow-sm shrink-0"><Calendar size={compactSchedule ? 17 : 24} /></div>
               <div>
                 <h1 className="text-base md:text-xl font-black text-slate-800 tracking-tight flex flex-wrap items-center gap-2 md:gap-3">
@@ -1871,6 +1900,7 @@ export default function App() {
                 </h1>
                 {!compactSchedule && scheduleSummary}
               </div>
+              {compactSchedule && undoButton}
             </div>
 
             <div className="w-full md:w-auto flex flex-wrap items-center gap-1.5 md:gap-3">
@@ -1885,6 +1915,7 @@ export default function App() {
               <button type="button" aria-label="回到本周" onClick={() => setViewWeekStart(getMonday(new Date()))} className="h-11 md:h-auto px-2.5 md:px-3 md:py-2 rounded-xl border border-slate-200 bg-white text-xs font-bold text-slate-600">{compactSchedule ? '本周' : '回到本周'}</button>
               <button type="button" onClick={switchScheduleView} className="h-11 md:h-auto px-2.5 md:px-3 md:py-2 rounded-xl border border-indigo-100 bg-indigo-50 text-xs font-bold text-indigo-600">{scheduleView === 'week' ? '列表视图' : '周视图'}</button>
               <button type="button" disabled={!canEdit || syncing} onClick={() => { setHideEmptyOverlay(true); openModal(); }} className="h-11 md:h-auto flex-1 md:flex-none justify-center bg-indigo-600 text-white px-2.5 md:px-4 md:py-2.5 rounded-xl text-xs md:text-sm font-black shadow-sm hover:bg-indigo-700 disabled:opacity-40 flex items-center gap-1 whitespace-nowrap"><Plus size={17} />新增排课</button>
+              {!compactSchedule && undoButton}
               <ScheduleActions compact={compactSchedule}>
               {compactSchedule && <div className="w-full rounded-2xl border border-indigo-100 bg-indigo-50/50 p-3 mb-1">{scheduleSummary}</div>}
               <button onClick={toggleFullscreen} className="inline-flex items-center gap-1.5 px-3 py-2.5 bg-white text-slate-600 border border-slate-200 rounded-lg text-sm font-bold shadow-sm hover:bg-slate-50 transition-all" title="全屏显示网页">
@@ -1905,9 +1936,6 @@ export default function App() {
                 <Sparkles size={16} className="text-purple-500" /> 智能顾问
               </button>
 
-              <button onClick={handleUndo} disabled={undoStack.length === 0 || syncing || !canEdit} className={`px-3 py-2.5 rounded-lg text-sm font-black shadow-sm transition-all flex items-center gap-1.5 border ${undoStack.length > 0 ? 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50' : 'bg-slate-50 text-slate-300 border-slate-100 cursor-not-allowed'}`} title="撤销操作">
-                <Undo size={16} />{compactSchedule && <span>撤销</span>}
-              </button>
               <button onClick={handleDownload} disabled={isDownloading} className="inline-flex items-center gap-1.5 px-3 py-2.5 bg-white text-slate-600 border border-slate-200 rounded-lg text-sm font-bold shadow-sm hover:bg-slate-50 transition-all" title="下载图片">
                 <Download size={16} className={isDownloading ? "animate-bounce" : ""} />{compactSchedule && <span>下载图片</span>}
               </button>

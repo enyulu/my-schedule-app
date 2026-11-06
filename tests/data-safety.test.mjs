@@ -3,6 +3,7 @@ import vm from 'node:vm';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { occurrenceDate } from '../src/timeZones.js';
+import { reconcileCourseSnapshot } from '../src/courseReceipts.js';
 const source = readFileSync(new URL('../src/App.jsx', import.meta.url), 'utf8');
 const raw = { id: 'real', name: 'Learner', colIndex: 0, startTime: '10:00', endTime: '11:00', value: 240, category: 'legacy', weekId: '2026-10-26', status: 'cancelled', completed: false, studentId: 'student-1', studentName: 'Nina' };
 function normalizer() {
@@ -70,7 +71,7 @@ test('account change clears undo history, editor and backup drafts', () => {
   const effect = source.slice(start, source.indexOf('\n  }, [authAttempt]);', start) + '\n  }, [authAttempt]);'.length);
   const state = {};
   let observer;
-  const context = { authAttempt: 0, auth: {}, isStandalone: true, activeUserIdRef: { current: null }, saveInFlightRef: { current: false }, pendingUndoRef: { current: null }, console: { error() {} }, useEffect: fn => fn(), onAuthStateChanged: (auth, cb) => { observer = cb; return () => {}; }, getMonday: value => value };
+  const context = { authAttempt: 0, auth: {}, isStandalone: true, activeUserIdRef: { current: null }, saveInFlightRef: { current: false }, courseRowsRef: { current: [] }, confirmedCoursesRef: { current: new Map() }, console: { error() {} }, useEffect: fn => fn(), onAuthStateChanged: (auth, cb) => { observer = cb; return () => {}; }, getMonday: value => value };
   for (const setter of new Set(effect.match(/set[A-Z]\w+/g))) context[setter] = value => { state[setter] = value; };
   vm.runInContext(effect, vm.createContext(context));
   observer({ uid: 'A' });
@@ -83,15 +84,16 @@ test('account change clears undo history, editor and backup drafts', () => {
 
 test('empty cache and read failures retain courses; confirmed empty server snapshot is read-only', () => {
   const start = source.indexOf('  useEffect(() => {\n    if (!user) return;');
-  const effect = source.slice(start, source.indexOf('\n  }, [user, loadAttempt]);', start) + '\n  }, [user, loadAttempt]);'.length);
+  const end = '\n  }, [user, loadAttempt, publishCourseRows]);';
+  const effect = source.slice(start, source.indexOf(end, start) + end.length);
   const state = { courses: [raw] };
   let snapshot, failure;
   const context = vm.createContext({
     user: { uid: 'test' }, loadAttempt: 0, currentWeekId: '2026-10-26',
     useEffect: fn => fn(), getCoursesRef() {},
     onSnapshot: (ref, options, success, error) => { snapshot = success; failure = error; return () => {}; },
-    normalizeCourseDataset: normalizer().normalizeCourseDataset,
-    setCourses: rows => { state.courses = rows; }, setStatisticsSource() {},
+    confirmedCoursesRef: { current: new Map() }, reconcileCourseSnapshot,
+    publishCourseRows: rows => { state.courses = normalizer().normalizeCourseDataset(rows, 'fixture'); },
     setDataState: status => { state.status = status; }, setLoadError: error => { state.error = error; }, setHideEmptyOverlay() {}, logFirestoreError() {},
   });
   vm.runInContext(effect, context);

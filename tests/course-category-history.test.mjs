@@ -3,6 +3,7 @@ import vm from 'node:vm';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { occurrenceDate } from '../src/timeZones.js';
+import { sharesCoursePriceScope } from '../src/courseReceipts.js';
 
 const source = readFileSync(new URL('../src/App.jsx', import.meta.url), 'utf8');
 const handlerStart = source.indexOf('  const handleSave = async');
@@ -12,7 +13,7 @@ const base = { id: 'wed', title: 'Jayden', name: 'Jayden', colIndex: 2, weekday:
 async function saveCategory({ courses = [base], id = 'wed', value = 240, category = 'P', duplicate = false, fail = false, form = {} } = {}) {
   const original = courses.find(course => course.id === id);
   const stored = new Map(courses.map(course => [course.id, structuredClone(course)]));
-  const errors = [];
+  const errors = [], relocations = [];
   const context = vm.createContext({
     courses: structuredClone(courses), editingCourseId: id, user: { uid: 'local-test-only' },
     formData: { ...original, recurrence: original.isFixed ? (original.isBiweekly ? 'biweekly' : 'weekly') : 'temp', tag: category, value, ...form },
@@ -21,12 +22,12 @@ async function saveCategory({ courses = [base], id = 'wed', value = 240, categor
     saveSnapshotForUndo() {}, setSyncing() {}, setIsModalOpen() {}, setCourseCelebration() {},
     setRestoreError: message => { if (message) errors.push(message); }, logFirestoreError() {}, setTimeout() {}, console: { info() {}, warn() {} },
     doc: (...parts) => String(parts.at(-1)).split('/').at(-1),
-    occurrenceDate,
+    occurrenceDate, sharesCoursePriceScope,
     courseWriteBatch: () => context.writeBatch(),
     writeBatch: () => {
       const operations = [];
       return {
-        inheritBinding() {}, bindCourse() {}, relocateBinding() {},
+        inheritBinding() {}, bindCourse() {}, relocateBinding: (...args) => relocations.push(args),
         set: (key, data) => operations.push(() => stored.set(key, structuredClone(data))),
         update: (key, data) => operations.push(() => stored.set(key, { ...stored.get(key), ...structuredClone(data) })),
         commit: async () => { if (fail) throw Error('simulated offline'); operations.forEach(run => run()); },
@@ -39,7 +40,7 @@ async function saveCategory({ courses = [base], id = 'wed', value = 240, categor
     + handler + '\nglobalThis.api = {save: handleSave, visible: isCourseVisibleInWeek};', context);
   await context.api.save(duplicate);
   return {
-    records: [...stored.values()], errors,
+    records: [...stored.values()], errors, relocations,
     at(week, colIndex = 2, startTime = '14:00') {
       return [...stored.values()].filter(course => course.colIndex === colIndex && course.startTime === startTime && context.api.visible(course, week));
     },
@@ -66,10 +67,11 @@ test('category with default price change preserves history and updates both tag 
   assert.equal(saved.at('2026-10-19')[0].price, 400);
 });
 
-test('same-name earlier lessons retain their category and price; category changes only the selected series', async () => {
-  const mon = { ...base, id: 'mon', colIndex: 0, weekday: 0 };
-  const temp = { ...base, id: 'earlier-wed', startTime: '10:00', endTime: '11:00', isFixed: false, weekId: '2026-10-19' };
-  const saved = await saveCategory({ courses: [base, mon, temp], value: 400 });
+test('same learner earlier lessons retain their category and price; category changes only the selected series', async () => {
+  const learner = { ...base, studentId: 'one' };
+  const mon = { ...learner, id: 'mon', colIndex: 0, weekday: 0 };
+  const temp = { ...learner, id: 'earlier-wed', startTime: '10:00', endTime: '11:00', isFixed: false, weekId: '2026-10-19' };
+  const saved = await saveCategory({ courses: [learner, mon, temp], value: 400 });
   assert.equal(saved.at('2026-10-19', 0)[0].category, 'A');
   assert.equal(saved.at('2026-10-19', 0)[0].price, 240);
   assert.equal(saved.at('2026-10-26', 0)[0].category, 'A');
@@ -77,6 +79,24 @@ test('same-name earlier lessons retain their category and price; category change
   assert.equal(saved.at('2026-10-19', 2, '10:00')[0].price, 240);
   assert.equal(saved.at('2026-10-19', 2, '10:00')[0].category, 'A');
   assert.equal(saved.at('2026-10-19')[0].category, 'P');
+});
+
+test('price changes do not affect a same-title course with a different or unknown learner', async () => {
+  const learner = { ...base, studentId: 'one' };
+  const other = { ...base, id: 'other', studentId: 'two', colIndex: 3, weekday: 3, value: 310, price: 310 };
+  const unknown = { ...base, id: 'unknown', colIndex: 4, weekday: 4, value: 280, price: 280 };
+  const saved = await saveCategory({ courses: [learner, other, unknown], value: 450, category: 'A' });
+  assert.deepEqual(saved.errors, []);
+  assert.equal(saved.at('2026-10-19')[0].price, 450);
+  assert.equal(saved.at('2026-10-19', 3)[0].price, 310);
+  assert.equal(saved.at('2026-10-19', 4)[0].price, 280);
+});
+
+test('editing a temporary lesson time and price together relocates its existing package binding', async () => {
+  const temp = { ...base, isFixed: false, weekId: '2026-10-19', baseWeekId: undefined };
+  const saved = await saveCategory({ courses: [temp], value: 450, category: 'A', form: { colIndex: 0, startTime: '10:00' } });
+  assert.deepEqual(saved.errors, []);
+  assert.deepEqual(saved.relocations, [['wed', 'wed', '2026-10-21|14:00', '2026-10-19|10:00', false]]);
 });
 
 test('biweekly category split keeps alternate-week cadence, exclusions and original end date', async () => {

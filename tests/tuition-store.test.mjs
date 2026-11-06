@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createTuitionStore, createCourseWriteBatch } from '../src/tuitionStore.js';
+import { stageCourseUndo } from '../src/courseReceipts.js';
 
 const fixture = () => {
   const records = new Map(), listeners = new Map();
@@ -19,6 +20,69 @@ const fixture = () => {
   return { store, records, listeners, sdk, setFail: value => { fail = value; }, deactivate: () => { active = false; } };
 };
 const accountChange = { collection: 'tuition_accounts', id: 'one', expectedVersion: 0, data: { studentName: 'Nina', subject: 'Math', category: 'A', startsAt: 1, reminderMinutes: 120 } };
+test('confirmed receipt preserves raw fields and undo never touches an unrelated later course', async () => {
+  const f = fixture(), root = 'artifacts/stable-schedule-private-v999/users/A/';
+  const ref = id => root + 'courses/' + id;
+  const original = { id: 'c', title: 'Fixture', category: 'A', notes: 'old', legacyField: 'keep' };
+  const unrelated = { id: 'later', title: 'Other device', category: 'B' };
+  let receipt;
+  const make = (beforeCourses, onApplied) => createCourseWriteBatch({ db: {}, appId: 'stable-schedule-private-v999', userId: 'A', isCurrentUser: () => true, sdk: f.sdk, beforeCourses, tuitionState: { status: 'ready', accounts: [], bindings: [] }, onApplied });
+  f.records.set(ref('c'), original);
+  const forward = make([original], result => { receipt = result; });
+  forward.update(ref('c'), { notes: 'updated' });
+  f.setFail(true); await assert.rejects(forward.commit(), /offline/); assert.equal(receipt, undefined);
+  f.setFail(false); await forward.commit();
+  const updated = { ...original, notes: 'updated' };
+  assert.deepEqual(receipt.courseChanges, [{ id: 'c', before: original, after: updated }]);
+  f.records.set(ref('later'), unrelated);
+  const undo = make([updated, unrelated]);
+  stageCourseUndo(undo, receipt, [updated, unrelated], [], ref);
+  await undo.commit();
+  assert.deepEqual(f.records.get(ref('c')), original);
+  assert.deepEqual(f.records.get(ref('later')), unrelated);
+});
+
+test('undo of a previously unbound copy refuses a binding added later by another device', async () => {
+  const f = fixture(), root = 'artifacts/stable-schedule-private-v999/users/A/';
+  const ref = id => root + 'courses/' + id;
+  const copy = { id: 'copy', title: 'Fixture', category: 'A' };
+  const account = { ...accountChange.data, id: 'one', version: 1 };
+  const binding = { id: 'copy', courseId: 'copy', version: 1, segments: [{ fromKey: '2026-11-02|09:00', toKey: null, accountId: 'one' }] };
+  let receipt;
+  const make = (beforeCourses, bindings, onApplied) => createCourseWriteBatch({ db: {}, appId: 'stable-schedule-private-v999', userId: 'A', isCurrentUser: () => true, sdk: f.sdk, beforeCourses, tuitionState: { status: 'ready', accounts: [account], bindings }, onApplied });
+  const forward = make([], [], result => { receipt = result; }); forward.set(ref('copy'), copy); await forward.commit();
+  f.records.set(root + 'tuition_bindings/copy', binding);
+  const undo = make([copy], [binding]);
+  assert.throws(() => stageCourseUndo(undo, receipt, [copy], [binding], ref), /课包关联已有后续修改/);
+  const staleUndo = make([copy], []);
+  stageCourseUndo(staleUndo, receipt, [copy], [], ref);
+  await assert.rejects(staleUndo.commit(), /课包关联已被修改/);
+  assert.deepEqual(f.records.get(ref('copy')), copy);
+});
+
+test('consecutive scoped undos restore package-only edits without rewinding versions', async () => {
+  const f = fixture(), root = 'artifacts/stable-schedule-private-v999/users/A/';
+  const ref = id => root + 'courses/' + id;
+  const course = { id: 'c', title: 'Fixture', category: 'A' };
+  const accounts = ['one', 'two'].map(id => ({ ...accountChange.data, id, version: 1 }));
+  f.records.set(ref('c'), course);
+  accounts.forEach(row => f.records.set(root + 'tuition_accounts/' + row.id, row));
+  const bindingPath = root + 'tuition_bindings/c';
+  const bindings = () => f.records.has(bindingPath) ? [f.records.get(bindingPath)] : [];
+  const receipts = [];
+  const make = onApplied => createCourseWriteBatch({ db: {}, appId: 'stable-schedule-private-v999', userId: 'A', isCurrentUser: () => true, sdk: f.sdk, beforeCourses: [course], tuitionState: { status: 'ready', accounts, bindings: bindings() }, onApplied });
+  for (const account of accounts) {
+    const batch = make(result => receipts.push(result));
+    batch.set(ref('c'), course); batch.bindCourse('c', '2026-11-02|09:00', account.id); await batch.commit();
+  }
+  assert.equal(receipts[0].courseChanges.length, 0);
+  for (const receipt of receipts.reverse()) {
+    const undo = make(); stageCourseUndo(undo, receipt, [course], bindings(), ref); await undo.commit();
+  }
+  assert.equal(f.records.get(bindingPath).version, 4);
+  assert.deepEqual(f.records.get(bindingPath).segments, []);
+  assert.deepEqual(f.records.get(ref('c')), course);
+});
 test('course-only recovery cannot change or remove an active package-bound lesson', async () => {
   const f = fixture(), root = 'artifacts/stable-schedule-private-v999/users/A/';
   const course = { id: 'c', title: 'Nina', category: 'A', colIndex: 2, startTime: '09:00', endTime: '10:00' };

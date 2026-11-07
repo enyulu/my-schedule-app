@@ -37,6 +37,24 @@ button {
   text-size-adjust: 100%;
 }
 
+/* Desktop density is independent of zoom: preserve type, compress whitespace. */
+.schedule-week-board--compact .schedule-week-day { padding-top: 7px; padding-bottom: 7px; min-width: 0; }
+.schedule-week-board--compact .schedule-day-totals { flex-direction: row; justify-content: center; flex-wrap: wrap; gap: 4px; margin-top: 5px; }
+.schedule-week-board--compact .schedule-course-card { overflow: hidden; }
+.schedule-week-board--compact .schedule-course-time-row { padding-right: 16px; }
+.schedule-week-board--compact .schedule-course-card--dense { padding: 4px 6px; gap: 1px; border-radius: 12px; }
+.schedule-week-board--compact .schedule-course-card--dense .schedule-course-time { font-size: 11px; line-height: 14px; }
+.schedule-week-board--compact .schedule-course-card--short { padding: 1px 4px; gap: 0; border-radius: 8px; }
+.schedule-week-board--compact .schedule-course-card--short .schedule-course-time { font-size: 10px; line-height: 12px; }
+.schedule-week-board--compact .schedule-course-card--short .schedule-course-title { font-size: 12px; line-height: 14px; }
+.schedule-week-board--compact .schedule-course-card--short .schedule-course-name-row { margin-top: 0; }
+.schedule-week-board--compact .schedule-course-card--short .schedule-course-price { font-size: 9px; line-height: 12px; }
+.schedule-week-board--compact .schedule-course-card--micro { padding: 0 4px; gap: 0; border-radius: 5px; }
+.schedule-week-board--compact .schedule-course-card--micro .schedule-course-time-row { display: none; }
+.schedule-week-board--compact .schedule-course-card--micro .schedule-course-name-row { margin-top: 0; }
+.schedule-week-board--compact .schedule-course-card--micro .schedule-course-title { font-size: 11px; line-height: 12px; }
+.schedule-week-board--compact .schedule-course-card--micro .schedule-course-price { display: none; }
+
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;

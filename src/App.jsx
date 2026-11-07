@@ -1,5 +1,6 @@
 import { useState, useMemo, useEffect, useRef, useCallback, useSyncExternalStore } from 'react';
 import { clampScheduleZoom, getScheduleFitPercent, getScheduleGridPoint, getScheduleStartMinutes } from './scheduleZoom';
+import { resolveWeekLayout, readWeekDensity, saveWeekDensity } from './scheduleLayout.js';
 import ScheduleActions from './ScheduleActions.jsx';
 import { readScheduleView, resolveScheduleView, saveScheduleView, compactScheduleSnapshot, subscribeCompactSchedule } from './scheduleView.js';
 import MonthlyReports from './MonthlyReports.jsx';
@@ -48,7 +49,6 @@ const db = getFirestore(app);
 const FIXED_APP_ID = 'stable-schedule-private-v999';
 
 // UI 与排版配置
-const PIXELS_PER_HOUR = 90; 
 const START_HOUR = 8;
 const END_HOUR = 23;
 const HOURS = Array.from({ length: END_HOUR - START_HOUR + 1 }, (_, i) => START_HOUR + i);
@@ -474,16 +474,14 @@ export default function App() {
   const appContainerRef = useRef(null);
   const scheduleViewportRef = useRef(null);
   const [scheduleViewportWidth, setScheduleViewportWidth] = useState(1000);
+  const [scheduleViewportHeight, setScheduleViewportHeight] = useState(800);
+  const [weekDensity, setWeekDensity] = useState(() => readWeekDensity());
   const [zoomPreference, setZoomPreference] = useState(() => {
     try {
       const saved = JSON.parse(localStorage.getItem('schedule-display-zoom'));
       return { mode: saved?.mode === 'fit' ? 'fit' : 'manual', percent: clampScheduleZoom(saved?.percent) };
     } catch { return { mode: 'manual', percent: 100 }; }
   });
-  const scheduleWidth = Math.max(1000, Math.min(1400, scheduleViewportWidth));
-  const scheduleZoom = zoomPreference.mode === 'fit'
-    ? getScheduleFitPercent(scheduleViewportWidth, scheduleWidth)
-    : zoomPreference.percent;
   useEffect(() => {
     try { localStorage.setItem('schedule-display-zoom', JSON.stringify(zoomPreference)); }
     catch { /* Display controls remain usable when browser storage is unavailable. */ }
@@ -558,11 +556,18 @@ export default function App() {
   const compactSchedule = useSyncExternalStore(subscribeCompactSchedule, compactScheduleSnapshot);
   const [viewPreference, setScheduleView] = useState(() => readScheduleView());
   const scheduleView = resolveScheduleView(viewPreference, compactSchedule);
+  const weekLayout = resolveWeekLayout({ width: scheduleViewportWidth, height: scheduleViewportHeight, density: weekDensity, zoom: zoomPreference.mode === 'fit' ? 100 : zoomPreference.percent, mobile: compactSchedule || scheduleView !== 'week' });
+  const scheduleWidth = weekLayout.boardWidth;
+  const scheduleZoom = zoomPreference.mode === 'fit'
+    ? getScheduleFitPercent(scheduleViewportWidth - (weekLayout.compact && weekLayout.sideRail ? 248 : 0), scheduleWidth)
+    : zoomPreference.percent;
+  const pixelsPerHour = weekLayout.pixelsPerHour;
+  const changeWeekDensity = density => { setWeekDensity(density); saveWeekDensity(undefined, density); };
   const switchScheduleView = () => {
     const next = scheduleView === 'week' ? 'list' : 'week';
     setScheduleView(next); saveScheduleView(undefined, next);
   };
-  const andyAtSide = (scheduleViewportWidth - (scheduleView === 'list' ? 768 : scheduleWidth * scheduleZoom / 100)) / 2 >= 296;
+  const andyAtSide = weekLayout.compact ? weekLayout.sideRail : (scheduleViewportWidth - (scheduleView === 'list' ? 768 : scheduleWidth * scheduleZoom / 100)) / 2 >= 296;
   const touchStartRef = useRef(null);
   
   const [isZenMode, setIsZenMode] = useState(false);
@@ -571,7 +576,10 @@ export default function App() {
   useEffect(() => {
     const viewport = scheduleViewportRef.current;
     if (!viewport) return;
-    const observer = new ResizeObserver(([entry]) => setScheduleViewportWidth(entry.contentRect.width));
+    const observer = new ResizeObserver(([entry]) => {
+      setScheduleViewportWidth(entry.contentRect.width);
+      setScheduleViewportHeight(entry.contentRect.height);
+    });
     observer.observe(viewport);
     return () => observer.disconnect();
   }, [authInitialized, user, isZenMode, isCssFullscreen]);
@@ -1112,7 +1120,7 @@ export default function App() {
       const actualDur = durMins > 0 ? durMins : durMins + 1440;
       
       const newStartMins = getScheduleStartMinutes(point.y - dragInfo.offsetY / scale, {
-        startHour: START_HOUR, endHour: END_HOUR + 1, pixelsPerHour: PIXELS_PER_HOUR, duration: actualDur, snap: 'round',
+        startHour: START_HOUR, endHour: END_HOUR + 1, pixelsPerHour, duration: actualDur, snap: 'round',
       });
       const newStartTime = minutesToTime(newStartMins);
       const newEndTime = minutesToTime(newStartMins + actualDur);
@@ -1167,7 +1175,7 @@ export default function App() {
     window.addEventListener('mousemove', handleMouseMove);
     window.addEventListener('mouseup', handleMouseUp);
     return () => { window.removeEventListener('mousemove', handleMouseMove); window.removeEventListener('mouseup', handleMouseUp); };
-  }, [dragInfo, viewWeekId, user, openModal, canEdit, syncing, courseWriteBatch]);
+  }, [dragInfo, viewWeekId, user, openModal, canEdit, syncing, courseWriteBatch, pixelsPerHour]);
 
   const handleConfirmMove = async (type) => {
     if (!moveConfirmInfo || !user || !canEdit || syncing || saveInFlightRef.current) return;
@@ -1914,6 +1922,9 @@ export default function App() {
               </div>
               <button type="button" aria-label="回到本周" onClick={() => setViewWeekStart(getMonday(new Date()))} className="h-11 md:h-auto px-2.5 md:px-3 md:py-2 rounded-xl border border-slate-200 bg-white text-xs font-bold text-slate-600">{compactSchedule ? '本周' : '回到本周'}</button>
               <button type="button" onClick={switchScheduleView} className="h-11 md:h-auto px-2.5 md:px-3 md:py-2 rounded-xl border border-indigo-100 bg-indigo-50 text-xs font-bold text-indigo-600">{scheduleView === 'week' ? '列表视图' : '周视图'}</button>
+              {!compactSchedule && scheduleView === 'week' && <div role="group" aria-label="周课表布局" className="flex items-center p-1 rounded-xl border border-slate-200 bg-slate-50">
+                {[['comfort', '舒适'], ['compact', '紧凑']].map(([value, label]) => <button key={value} type="button" aria-pressed={weekDensity === value} onClick={() => changeWeekDensity(value)} title={value === 'compact' ? '减少留白，保留清晰字号；必要时允许滚动' : '恢复舒展的时间轴与卡片间距'} className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-colors ${weekDensity === value ? 'bg-white text-indigo-700 shadow-sm ring-1 ring-slate-200/70' : 'text-slate-500 hover:text-slate-800'}`}>{label}</button>)}
+              </div>}
               <button type="button" disabled={!canEdit || syncing} onClick={() => { setHideEmptyOverlay(true); openModal(); }} className="h-11 md:h-auto flex-1 md:flex-none justify-center bg-indigo-600 text-white px-2.5 md:px-4 md:py-2.5 rounded-xl text-xs md:text-sm font-black shadow-sm hover:bg-indigo-700 disabled:opacity-40 flex items-center gap-1 whitespace-nowrap"><Plus size={17} />新增排课</button>
               {!compactSchedule && undoButton}
               <ScheduleActions compact={compactSchedule}>
@@ -2013,7 +2024,7 @@ export default function App() {
       )}
 
       <div ref={scheduleViewportRef} className={`flex-1 min-h-0 overflow-auto relative z-0 transition-colors duration-300 ${isViewingCurrentWeek ? 'bg-indigo-50/80' : 'bg-slate-100/70'} ${isZenMode || isCssFullscreen ? 'p-0' : 'p-3 sm:p-6'}`}>
-        <div className={andyAtSide ? 'andy-counter-rail' : undefined}>
+        <div className={andyAtSide ? `andy-counter-rail${weekLayout.compact ? ' andy-counter-rail--compact' : ''}` : undefined}>
           <AndyCounter key={user?.uid || 'signed-out'} counter={andy} side={andyAtSide} />
         </div>
         
@@ -2069,19 +2080,19 @@ export default function App() {
               })}</div>
             </section>;
           })}
-        </div> : <div ref={scheduleRef} style={{ width: scheduleWidth, zoom: scheduleZoom / 100 }} onContextMenu={e => e.preventDefault()} className={`mx-auto bg-white flex flex-col relative border transition-colors ${isViewingCurrentWeek ? 'shadow-xl shadow-indigo-200/50 border-indigo-300 ring-4 ring-indigo-100' : 'shadow-sm border-slate-200'}`}>
+        </div> : <div ref={scheduleRef} style={{ width: scheduleWidth, zoom: scheduleZoom / 100, ...(weekLayout.compact && andyAtSide ? { marginLeft: 248 / (scheduleZoom / 100), marginRight: 0 } : {}) }} onContextMenu={e => e.preventDefault()} className={`schedule-week-board ${weekLayout.compact ? 'schedule-week-board--compact' : ''} mx-auto bg-white flex flex-col relative border transition-colors ${isViewingCurrentWeek ? 'shadow-xl shadow-indigo-200/50 border-indigo-300 ring-4 ring-indigo-100' : 'shadow-sm border-slate-200'}`}>
           {isViewingCurrentWeek && (
             <div className="bg-gradient-to-r from-indigo-600 to-violet-500 text-white text-center py-1.5 text-[11px] font-black tracking-[0.3em] sticky top-0 z-[45]">
               当前周课表
             </div>
           )}
-          <div className={`flex border-b border-slate-100 bg-white/95 backdrop-blur-md sticky z-[40] shadow-sm ${isViewingCurrentWeek ? 'top-[26px]' : 'top-0'}`}>
+          <div className={`schedule-week-header flex border-b border-slate-100 bg-white/95 backdrop-blur-md sticky z-[40] shadow-sm ${isViewingCurrentWeek ? 'top-[26px]' : 'top-0'}`}>
             <div className="w-[65px] border-r border-slate-100 shrink-0"></div>
             {DAYS.map((day, idx) => (
-              <div key={idx} className={`flex-1 text-center py-3 border-r border-slate-100 last:border-r-0 ${DAY_THEMES[idx].bg}`}>
+              <div key={idx} className={`schedule-week-day flex-1 text-center py-3 border-r border-slate-100 last:border-r-0 ${DAY_THEMES[idx].bg}`}>
                 <div className={`text-[15px] font-black ${DAY_THEMES[idx].text}`}>{String(day)}</div>
                 <div className="text-[10px] text-slate-400 font-bold mt-0.5 tracking-widest">{String(weekDates[idx])}</div>
-                <div className="flex flex-col items-center gap-1 mt-1.5">
+                <div className="schedule-day-totals flex flex-col items-center gap-1 mt-1.5">
                   <div className="text-[11px] font-black text-purple-600 bg-purple-50 px-2 py-0.5 rounded-md border border-purple-200 inline-block shadow-sm leading-none">
                     ¥ {String(totals.daily[idx])}
                   </div>
@@ -2098,13 +2109,13 @@ export default function App() {
           <div className="flex relative bg-white" ref={gridBodyRef}>
             <div className="w-[65px] border-r border-slate-100 bg-white relative z-10 font-bold shrink-0">
               {HOURS.map(hour => (
-                <div key={hour} className="text-[10px] text-slate-300 font-black text-center relative" style={{ height: PIXELS_PER_HOUR }}>
+                <div key={hour} className="text-[10px] text-slate-300 font-black text-center relative" style={{ height: pixelsPerHour }}>
                   <span className="absolute -top-2.5 left-0 right-0">{String(hour).padStart(2, '0')}:00</span>
                 </div>
               ))}
             </div>
             <div className="flex-1 flex relative">
-              <div className="absolute inset-0 pointer-events-none flex flex-col">{HOURS.map(hour => (<div key={hour} className="border-b border-slate-50 w-full" style={{ height: PIXELS_PER_HOUR }}></div>))}</div>
+              <div className="absolute inset-0 pointer-events-none flex flex-col">{HOURS.map(hour => (<div key={hour} className="border-b border-slate-50 w-full" style={{ height: pixelsPerHour }}></div>))}</div>
               {DAYS.map((_, colIdx) => {
                 const colGroups = groupedCoursesByCol[colIdx] || [];
                 return (
@@ -2114,7 +2125,7 @@ export default function App() {
                         const rect = e.currentTarget.getBoundingClientRect();
                         const scale = rect.height / e.currentTarget.offsetHeight;
                         const y = (e.clientY - rect.top) / scale;
-                        const clickMins = getScheduleStartMinutes(y, { startHour: START_HOUR, endHour: END_HOUR + 1, pixelsPerHour: PIXELS_PER_HOUR });
+                        const clickMins = getScheduleStartMinutes(y, { startHour: START_HOUR, endHour: END_HOUR + 1, pixelsPerHour });
                         openModal(null, colIdx, minutesToTime(clickMins));
                       }
                     }}>
@@ -2127,9 +2138,10 @@ export default function App() {
                       
                       const theme = (TAGS[course.tag] || TAGS.unclassified).theme;
                       const hasOverlap = group.length > 1;
-                      const startPx = ((course.startM - START_HOUR * 60) / 60) * PIXELS_PER_HOUR;
-                      const heightPx = ((course.endM - course.startM) / 60) * PIXELS_PER_HOUR;
-                      const isCompact = heightPx < PIXELS_PER_HOUR;
+                      const startPx = ((course.startM - START_HOUR * 60) / 60) * pixelsPerHour;
+                      const heightPx = ((course.endM - course.startM) / 60) * pixelsPerHour;
+                      const isCompact = heightPx < pixelsPerHour;
+                      const isMicro = weekLayout.compact && heightPx < 30;
                       const displayInfo = getCourseDisplayInfo(course, viewWeekId);
                       const finalNotes = [displayInfo.dynamicNote, course.notes].filter(Boolean).join(' | ');
                       const zonePreview = courseZonePreviews.get(course.id);
@@ -2141,22 +2153,23 @@ export default function App() {
                           onPointerUp={event => { const start = touchStartRef.current; if (event.pointerType === 'touch' && start?.id === course.id) { touchStartRef.current.at = event.timeStamp; if (!event.target.closest('button') && Math.abs(event.clientX - start.x) < 8 && Math.abs(event.clientY - start.y) < 8) openModal(course); } }}
                           onMouseDown={(e) => handleCourseMouseDown(e, course)}
                           title={`${displayInfo.title} · ${course.startTime}—${course.endTime}${finalNotes ? ` · ${finalNotes}` : ''}`}
-                          className={`schedule-course-card absolute rounded-2xl cursor-grab active:cursor-grabbing transition-all duration-300 hover:scale-[1.01] flex flex-col shadow-sm group/card ${isCompact ? 'p-1 gap-0.5' : 'p-2 gap-0.5'}
+                          className={`schedule-course-card ${weekLayout.compact ? isCompact ? isMicro ? 'schedule-course-card--micro' : 'schedule-course-card--short' : 'schedule-course-card--dense' : ''} absolute rounded-2xl cursor-grab active:cursor-grabbing transition-all duration-300 hover:scale-[1.01] flex flex-col shadow-sm group/card ${isCompact ? 'p-1 gap-0.5' : 'p-2 gap-0.5'}
                             ${theme.bg} ${theme.text}
                             ${!course.isFixed ? `border-[1.5px] border-dashed ${theme.border}` : course.isBiweekly ? `border-[1.5px] border-dotted ${theme.border}` : `border border-solid ${theme.border}`}
                           `}
                           style={{ top: `${startPx + 2}px`, height: `${heightPx - 4}px`, zIndex: 20, left: '4px', right: '4px' }}>
                           
-                          <div className="flex items-center gap-1 shrink-0 min-w-0">
+                          <div className="schedule-course-time-row flex items-center gap-1 shrink-0 min-w-0">
                             <span className={`shrink-0 flex items-center justify-center rounded-full font-black text-white ${isCompact ? 'w-2.5 h-2.5 text-[6px]' : 'w-3.5 h-3.5 text-[8px]'} ${(TAGS[course.tag] || TAGS.unclassified).badge.split(' ')[0]}`}>{String(course.tag)}</span>
-                            <span className={`min-w-0 whitespace-nowrap font-bold text-slate-500 tracking-tight ${isCompact ? 'text-[7px] leading-[10px]' : 'text-[10px] leading-[14px]'}`}>{course.startTime}—{course.endTime}</span>
+                            <span className={`schedule-course-time min-w-0 whitespace-nowrap font-bold text-slate-500 tracking-tight ${isCompact ? 'text-[7px] leading-[10px]' : 'text-[10px] leading-[14px]'}`}>{course.startTime}—{course.endTime}</span>
                             {(!course.isFixed || course.isBiweekly) && (!isCompact || !hasOverlap) && <span className="ml-auto shrink-0 text-[7px] leading-[10px] text-slate-500 bg-white/80 rounded px-0.5 group-hover/card:opacity-0">{course.isBiweekly ? '隔周' : '临时'}</span>}
-                            {isCompact && hasOverlap && <button onClick={e => { e.stopPropagation(); setOverlapState(prev => ({ ...prev, [stateKey]: (activeIdx + 1) % group.length })); }} className="ml-auto shrink-0 flex items-center gap-0.5 rounded bg-white/80 text-[7px] leading-[10px] font-bold"><Layers size={7} />{activeIdx + 1}/{group.length}</button>}
+                            {isCompact && hasOverlap && !isMicro && <button onClick={e => { e.stopPropagation(); setOverlapState(prev => ({ ...prev, [stateKey]: (activeIdx + 1) % group.length })); }} className="ml-auto shrink-0 flex items-center gap-0.5 rounded bg-white/80 text-[7px] leading-[10px] font-bold"><Layers size={7} />{activeIdx + 1}/{group.length}</button>}
                             {isCompact && zonePreview && <CourseTimeZoneBadge compact preview={zonePreview} zone={course.studentTimeZone} notes={finalNotes} onClick={() => openCourseTimeZone(course, zonePreview)} />}
                             <button disabled={syncing || !canEdit} aria-label={`删除课程${course.title}`} onClick={e => { e.stopPropagation(); performDelete(course.id); }} className="hidden sm:block absolute top-1 right-1 p-0.5 rounded bg-white opacity-0 pointer-events-none group-hover/card:opacity-100 group-hover/card:pointer-events-auto focus:opacity-100 focus:pointer-events-auto text-slate-400 hover:text-red-500"><X size={isCompact ? 10 : 12} /></button>
                           </div>
-                          <div className={`flex items-center gap-1 shrink-0 min-w-0 ${isCompact ? 'mt-auto' : ''}`}>
+                          <div className={`schedule-course-name-row flex items-center gap-1 shrink-0 min-w-0 ${isCompact ? 'mt-auto' : ''}`}>
                             <div className={`schedule-course-title min-w-0 flex-1 truncate font-black pointer-events-none text-slate-900 ${isCompact ? 'text-[10px] leading-[12px]' : 'text-[14px] leading-[18px]'}`}>{String(displayInfo.title)}</div>
+                            {isMicro && hasOverlap && <button onClick={e => { e.stopPropagation(); setOverlapState(prev => ({ ...prev, [stateKey]: (activeIdx + 1) % group.length })); }} className="shrink-0 flex items-center gap-0.5 rounded bg-white/80 text-[8px] leading-[12px] font-bold" title="切换重叠课程"><Layers size={8} />{activeIdx + 1}/{group.length}</button>}
                             {isCompact && <span className="schedule-course-price shrink-0 text-[8px] leading-[12px] font-bold text-slate-500">¥{getCourseTotalValue(course, new Date(viewWeekStart.getTime() + colIdx * 86400000))}</span>}
                           </div>
                           {!isCompact && (zonePreview ? <CourseTimeZoneBadge preview={zonePreview} zone={course.studentTimeZone} notes={finalNotes} onClick={() => openCourseTimeZone(course, zonePreview)} /> : finalNotes && <div className="schedule-course-notes shrink-0 min-w-0 truncate text-[10px] leading-[12px] font-bold text-slate-500">{finalNotes}</div>)}

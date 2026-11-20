@@ -90,6 +90,23 @@ const getMonday = (date) => {
 const formatDate = (date) => `${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 const getWeekId = (mondayDate) => `${mondayDate.getFullYear()}-${formatDate(mondayDate)}`;
 const timeToMinutes = (t) => { if (!t) return 0; const [h, m] = t.split(':').map(Number); return h * 60 + m; };
+const getLessonMinutes = (course) => {
+  const minutes = timeToMinutes(course.endTime) - timeToMinutes(course.startTime);
+  return minutes > 0 ? minutes : minutes + 1440;
+};
+const normalizeLessonStart = value => Math.max(1, Math.round((Number(value) || 1) * 100) / 100);
+const getLessonTrackingKey = course => {
+  const title = String(course.title || '').trim();
+  for (const field of ['studentId', 'studentName', 'student']) {
+    const identity = String(course[field] || '').trim();
+    if (identity) return JSON.stringify([title, field, identity]);
+  }
+  // Old records without learner identity retain their existing title scope.
+  return title;
+};
+const isCourseInactive = course => course.cancelled || course.canceled || course.isCancelled || course.isCanceled || course.isSuspended
+  || course.completed === false || course.isCompleted === false
+  || ['cancelled', 'canceled', 'suspended', 'incomplete', 'unfinished', 'pending', '未完成', '取消', '已取消', '停课'].includes(String(course.status || '').trim().toLowerCase());
 const minutesToTime = (totalMinutes) => {
   const h = Math.floor(totalMinutes / 60) % 24, m = totalMinutes % 60;
   return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
@@ -161,9 +178,7 @@ const collectCompletedLessons = (courses, range, now, { includeUnfinished = fals
     const weekday = (day.getDay() + 6) % 7;
     const weekId = getWeekId(getMonday(day));
     courses.forEach(course => {
-      const status = String(course.status || '').trim().toLowerCase();
-      if (course.cancelled || course.canceled || course.isCancelled || course.isCanceled || course.isSuspended || course.completed === false || course.isCompleted === false
-        || ['cancelled', 'canceled', 'suspended', 'incomplete', 'unfinished', 'pending', '未完成', '取消', '已取消', '停课'].includes(status)) return;
+      if (isCourseInactive(course)) return;
       if (Number(course.colIndex ?? course.weekday) !== weekday || !isCourseVisibleInWeek(course, weekId)) return;
       if (!COURSE_TIME_PATTERN.test(course.startTime || '') || !COURSE_TIME_PATTERN.test(course.endTime || '')) return;
       const startMinutes = timeToMinutes(course.startTime);
@@ -305,7 +320,7 @@ const normalizeCourse = (rawCourse, index, targetWeekId = currentWeekId) => {
       colIndex: Number.isInteger(Number(anchor.colIndex)) ? Number(anchor.colIndex) : -1,
       startTime: COURSE_TIME_PATTERN.test(anchor.startTime || '') ? anchor.startTime : '00:00',
       courseId: typeof anchor.courseId === 'string' ? anchor.courseId : '',
-      lessonNumber: Math.max(0, Math.round(Number(anchor.lessonNumber) || 0)),
+      lessonNumber: Math.max(0, Math.round((Number(anchor.lessonNumber) || 0) * 100) / 100),
     }))
     .sort((a, b) => getLessonAnchorKey(a).localeCompare(getLessonAnchorKey(b)));
   const normalized = {
@@ -446,24 +461,11 @@ const replaceFirestoreSchedule = async (userId, rawCourses, source, targetWeekId
   }
 };
 
-const getCourseTotalValue = (course, courseDate) => {
+const getCourseTotalValue = (course) => {
   if (!course || !course.startTime || !course.endTime) return 0;
   let durMins = timeToMinutes(course.endTime) - timeToMinutes(course.startTime);
   if (durMins < 0) durMins += 1440;
-  let hourlyRate = Number(course.price ?? course.value) || 0;
-
-  // 兼容升级前已存在的两条日期计价规则；新建或调价后的课程均使用保存的明确单价。
-  if (!course.priceEffectiveWeek && courseDate) {
-    const checkDate = new Date(courseDate);
-    checkDate.setHours(0, 0, 0, 0);
-
-    if (course.title?.includes('David') && checkDate >= new Date(2026, 5, 3)) {
-      hourlyRate = 400;
-    }
-    if (course.title?.includes('芮彤') && checkDate < new Date(2026, 4, 10)) {
-      hourlyRate = 260;
-    }
-  }
+  const hourlyRate = Number(course.price ?? course.value) || 0;
 
   return Math.round(hourlyRate * (durMins / 60));
 };
@@ -820,7 +822,8 @@ export default function App() {
     const settings = new Map();
     courses.forEach(course => {
       if (!course.title) return;
-      const existing = settings.get(course.title) || {
+      const scope = getLessonTrackingKey(course);
+      const existing = settings.get(scope) || {
         enabled: false,
         anchors: new Map(),
         settingWeek: '',
@@ -833,13 +836,14 @@ export default function App() {
       (course.lessonTrackingAnchors || []).forEach(anchor => {
         existing.anchors.set(getLessonAnchorKey(anchor), anchor);
       });
-      settings.set(course.title, existing);
+      settings.set(scope, existing);
     });
     return settings;
   }, [courses]);
 
   const getCourseLessonNumber = useCallback((course, currentWeek, includeDisabled = false) => {
-    const trackingSettings = lessonSettingsByTitle.get(course.title);
+    const scope = getLessonTrackingKey(course);
+    const trackingSettings = lessonSettingsByTitle.get(scope);
     if (!trackingSettings || (!trackingSettings.enabled && !includeDisabled)) return null;
 
     const targetKey = getOccurrenceKey(currentWeek, course);
@@ -850,74 +854,36 @@ export default function App() {
     if (!latestAnchorEntry) return null;
 
     const [anchorKey, anchor] = latestAnchorEntry;
-    let lessonNumber = Number(anchor.lessonNumber) || 0;
+    // Anchors store the starting hour (1 means no previous hours). Count the
+    // anchor lesson itself, using minutes to avoid rounding each occurrence.
+    let lessonMinutes = Math.max(0, (Number(anchor.lessonNumber) || 0) - 1) * 60;
     let iterWeekId = anchor.weekId;
     let safety = 0;
 
     while (iterWeekId <= currentWeek && safety < 1000) {
       safety += 1;
       const weekCourses = courses
-        .filter(candidate => candidate.title === course.title && isCourseVisibleInWeek(candidate, iterWeekId))
+        .filter(candidate => getLessonTrackingKey(candidate) === scope && !isCourseInactive(candidate) && isCourseVisibleInWeek(candidate, iterWeekId))
         .sort((a, b) => getOccurrenceKey(iterWeekId, a).localeCompare(getOccurrenceKey(iterWeekId, b)));
 
       weekCourses.forEach(candidate => {
         const occurrenceKey = getOccurrenceKey(iterWeekId, candidate);
-        if (occurrenceKey > anchorKey && occurrenceKey <= targetKey) lessonNumber += 1;
+        if (occurrenceKey >= anchorKey && occurrenceKey <= targetKey) lessonMinutes += getLessonMinutes(candidate);
       });
       iterWeekId = getNextWeekId(iterWeekId);
     }
 
-    return lessonNumber > 0 ? lessonNumber : null;
+    return lessonMinutes > 0 ? Math.round(lessonMinutes / 60 * 100) / 100 : null;
   }, [courses, lessonSettingsByTitle]);
 
   const getCourseDisplayInfo = useCallback((course, currentWeek) => {
     const baseTitle = course.title ? course.title.replace(/\s*\(第\d+课\)/g, '') : '';
     let dynamicNote = '';
-    const [y, m, d] = currentWeek.split('-').map(Number);
-    const targetMon = new Date(y, m - 1, d);
-
     const lessonNumber = getCourseLessonNumber(course, currentWeek);
-    if (lessonNumber) dynamicNote = `第${lessonNumber}课时`;
-
-    if (course.title && course.title.includes('芮彤')) {
-      let totalMins = 0, safety = 0;
-      let startMon = getMonday(new Date(2026, 4, 10)); 
-      let currentIterMon = new Date(startMon);
-      
-      while (currentIterMon <= targetMon && safety < 1000) {
-        safety++;
-        const iw = getWeekId(currentIterMon);
-        const wc = courses.filter(c => c.title?.includes('芮彤') && isCourseVisibleInWeek(c, iw))
-          .sort((a,b) => a.colIndex !== b.colIndex ? a.colIndex - b.colIndex : timeToMinutes(a.startTime) - timeToMinutes(b.startTime));
-
-        for (let c of wc) {
-           const cDate = new Date(currentIterMon);
-           cDate.setDate(cDate.getDate() + c.colIndex);
-           if (cDate < new Date(2026, 4, 10)) continue;
-           if (iw === currentWeek) {
-              if (c.colIndex < course.colIndex || (c.colIndex === course.colIndex && timeToMinutes(c.startTime) <= timeToMinutes(course.startTime))) {
-                 let dur = timeToMinutes(c.endTime) - timeToMinutes(c.startTime);
-                 if (dur < 0) dur += 1440;
-                 totalMins += dur;
-              }
-           } else {
-              let dur = timeToMinutes(c.endTime) - timeToMinutes(c.startTime);
-              if (dur < 0) dur += 1440;
-              totalMins += dur;
-           }
-        }
-        currentIterMon.setDate(currentIterMon.getDate() + 7);
-      }
-      
-      if (totalMins > 0) {
-        const hours = totalMins / 60;
-        const ruiTongNote = `累计 ${Number.isInteger(hours) ? hours : hours.toFixed(1)} h`;
-        dynamicNote = dynamicNote ? `${dynamicNote} | ${ruiTongNote}` : ruiTongNote;
-      }
-    }
+    if (lessonNumber) dynamicNote = `累计${lessonNumber}课时`;
 
     return { title: baseTitle, dynamicNote };
-  }, [courses, getCourseLessonNumber]);
+  }, [getCourseLessonNumber]);
 
   const visibleCourses = useMemo(
     () => courses.filter(course => isCourseVisibleInWeek(course, viewWeekId)),
@@ -1382,7 +1348,7 @@ export default function App() {
     data.price = Number(formData.value);
     data.category = formData.tag;
     if (formData.studentTimeZoneChanged) data.studentTimeZoneUpdatedAt = Date.now();
-    const learnerLessonSettings = lessonSettingsByTitle.get(formData.title.trim());
+    const learnerLessonSettings = lessonSettingsByTitle.get(getLessonTrackingKey(formData));
     const nextLessonEnabled = typeof formData.pendingLessonTrackingEnabled === 'boolean'
       ? formData.pendingLessonTrackingEnabled
       : Boolean(learnerLessonSettings?.enabled);
@@ -1393,7 +1359,7 @@ export default function App() {
         colIndex: data.colIndex,
         startTime: data.startTime,
         courseId: targetId,
-        lessonNumber: Math.max(1, Math.round(Number(formData.pendingLessonNumber) || 1)),
+        lessonNumber: normalizeLessonStart(formData.pendingLessonNumber),
       };
       lessonAnchorMap.set(getLessonAnchorKey(pendingAnchor), pendingAnchor);
     }
@@ -1557,7 +1523,7 @@ export default function App() {
       relocateTemporaryBinding(batch, targetId);
       applyTuitionSelection(batch, targetId);
       if (typeof formData.pendingLessonTrackingEnabled === 'boolean') {
-        courses.filter(course => course.title === data.title && course.id !== targetId).forEach(course => {
+        courses.filter(course => getLessonTrackingKey(course) === getLessonTrackingKey(data) && course.id !== targetId).forEach(course => {
           batch.update(doc(db, 'artifacts', FIXED_APP_ID, 'users', user.uid, 'courses', course.id), {
             lessonTrackingEnabled: nextLessonEnabled,
             lessonTrackingAnchors: data.lessonTrackingAnchors,
@@ -1654,16 +1620,19 @@ export default function App() {
     const title = formData.title.trim();
     if (!title) return;
     const editingCourse = editingCourseId ? courses.find(course => course.id === editingCourseId) : null;
-    const savedSettings = lessonSettingsByTitle.get(title);
+    const savedSettings = lessonSettingsByTitle.get(getLessonTrackingKey(formData));
     const currentLessonNumber = editingCourse
       ? getCourseLessonNumber(editingCourse, viewWeekId, true)
-      : Number(formData.pendingLessonNumber) || 1;
+      : null;
+    const startingLessonNumber = formData.pendingLessonNumber ?? (currentLessonNumber === null
+      ? 1
+      : currentLessonNumber - getLessonMinutes(editingCourse) / 60 + 1);
 
     setLessonSettingsDraft({
       enabled: typeof formData.pendingLessonTrackingEnabled === 'boolean'
         ? formData.pendingLessonTrackingEnabled
         : Boolean(savedSettings?.enabled),
-      lessonNumber: Math.max(1, currentLessonNumber || 1),
+      lessonNumber: normalizeLessonStart(startingLessonNumber),
     });
     setLessonSettingsStatus('');
     setIsLessonSettingsModalOpen(true);
@@ -1673,7 +1642,7 @@ export default function App() {
     if (!canEdit || syncing || saveInFlightRef.current) return;
     const title = formData.title.trim();
     if (!title) return;
-    const lessonNumber = Math.max(1, Math.round(Number(lessonNumberOverride ?? lessonSettingsDraft.lessonNumber) || 1));
+    const lessonNumber = normalizeLessonStart(lessonNumberOverride ?? lessonSettingsDraft.lessonNumber);
     const enabled = Boolean(lessonSettingsDraft.enabled || lessonNumberOverride !== null);
     const editingCourse = editingCourseId ? courses.find(course => course.id === editingCourseId) : null;
 
@@ -1683,15 +1652,16 @@ export default function App() {
         pendingLessonTrackingEnabled: enabled,
         pendingLessonNumber: enabled ? lessonNumber : null,
       }));
-      setLessonSettingsStatus(enabled ? `保存课程后，本堂将显示为第${lessonNumber}课时` : '保存课程后将关闭课时编号');
+      setLessonSettingsStatus(enabled ? `保存课程后，从本堂第${lessonNumber}课时起按时长累计` : '保存课程后将关闭课时累计');
       setTimeout(() => setIsLessonSettingsModalOpen(false), 500);
       return;
     }
 
     if (!user) return;
     saveInFlightRef.current = true;
-    const matchingCourses = courses.filter(course => course.title === title);
-    const anchorMap = new Map(lessonSettingsByTitle.get(title)?.anchors || []);
+    const scope = getLessonTrackingKey(editingCourse);
+    const matchingCourses = courses.filter(course => getLessonTrackingKey(course) === scope);
+    const anchorMap = new Map(lessonSettingsByTitle.get(scope)?.anchors || []);
     const currentAnchor = {
       weekId: viewWeekId,
       colIndex: editingCourse.colIndex,
@@ -1713,7 +1683,7 @@ export default function App() {
         });
       });
       await batch.commit();
-      setLessonSettingsStatus(enabled ? `已从本堂设为第${lessonNumber}课时` : '已关闭课时编号');
+      setLessonSettingsStatus(enabled ? `已从本堂第${lessonNumber}课时起按时长累计` : '已关闭课时累计');
       setTimeout(() => setIsLessonSettingsModalOpen(false), 500);
     } catch (error) {
       logFirestoreError('lesson-tracking:save', error);
@@ -2314,6 +2284,11 @@ export default function App() {
                                 setFormData({
                                   ...formData,
                                   title: name,
+                                  ...(!editingCourseId ? {
+                                    studentId: existingCourse.studentId || '',
+                                    studentName: existingCourse.studentName || '',
+                                    student: existingCourse.student || '',
+                                  } : {}),
                                   value: existingCourse.value,
                                   price: existingCourse.value,
                                   tag: existingCourse.tag ?? 'P',
@@ -2523,7 +2498,7 @@ export default function App() {
           <div className="bg-white rounded-[28px] shadow-2xl w-full max-w-md border border-slate-100 overflow-hidden">
             <div className="px-6 py-5 bg-emerald-50 border-b border-emerald-100 flex items-center justify-between">
               <div>
-                <h2 className="text-lg font-black text-slate-800 flex items-center gap-2"><Settings2 size={19} className="text-emerald-600"/> 课时编号设置</h2>
+                <h2 className="text-lg font-black text-slate-800 flex items-center gap-2"><Settings2 size={19} className="text-emerald-600"/> 课时累计设置</h2>
                 <p className="text-[11px] font-bold text-slate-500 mt-1">{formData.title} · {DAYS[formData.colIndex]} {formData.startTime}</p>
               </div>
               <button onClick={() => setIsLessonSettingsModalOpen(false)} className="p-2 rounded-xl text-slate-400 hover:bg-white hover:text-slate-600 transition-all"><X size={18}/></button>
@@ -2532,7 +2507,7 @@ export default function App() {
             <div className="p-6 space-y-5">
               <div className="flex items-center justify-between p-4 rounded-2xl bg-slate-50 border border-slate-100">
                 <div>
-                  <div className="text-[14px] font-black text-slate-700">显示课时编号</div>
+                  <div className="text-[14px] font-black text-slate-700">显示累计课时</div>
                   <div className="text-[11px] font-bold text-slate-400 mt-0.5">关闭后保留历史设置，但课程卡不显示编号</div>
                 </div>
                 <button
@@ -2544,20 +2519,21 @@ export default function App() {
               </div>
 
               <div className={`space-y-3 transition-opacity ${lessonSettingsDraft.enabled ? 'opacity-100' : 'opacity-40 pointer-events-none'}`}>
-                <label className="text-[13px] font-black text-slate-700">当前这堂课是第几课时</label>
+                <label className="text-[13px] font-black text-slate-700">本堂从第几课时开始累计</label>
                 <div className="flex items-center gap-3">
                   <button onClick={() => setLessonSettingsDraft(prev => ({ ...prev, lessonNumber: Math.max(1, prev.lessonNumber - 1) }))} className="w-12 h-12 rounded-2xl bg-slate-100 text-slate-600 text-xl font-black hover:bg-slate-200">−</button>
                   <input
                     type="number"
                     min="1"
-                    step="1"
+                    step="0.25"
                     value={lessonSettingsDraft.lessonNumber}
-                    onChange={e => setLessonSettingsDraft(prev => ({ ...prev, lessonNumber: Math.max(1, Math.round(Number(e.target.value) || 1)) }))}
+                    onChange={e => setLessonSettingsDraft(prev => ({ ...prev, lessonNumber: normalizeLessonStart(e.target.value) }))}
                     className="flex-1 h-12 rounded-2xl border-2 border-emerald-100 text-center text-lg font-black text-emerald-700 outline-none focus:border-emerald-400"
                   />
-                  <button onClick={() => setLessonSettingsDraft(prev => ({ ...prev, lessonNumber: prev.lessonNumber + 1 }))} className="h-12 px-4 rounded-2xl bg-emerald-50 text-emerald-700 text-[12px] font-black hover:bg-emerald-100 flex items-center gap-1"><Plus size={15}/> 新增一节</button>
+                  <button onClick={() => setLessonSettingsDraft(prev => ({ ...prev, lessonNumber: normalizeLessonStart(prev.lessonNumber + 1) }))} className="h-12 px-4 rounded-2xl bg-emerald-50 text-emerald-700 text-[12px] font-black hover:bg-emerald-100 flex items-center gap-1"><Plus size={15}/> 加1课时</button>
                 </div>
-                <p className="text-[11px] font-bold text-slate-400 leading-relaxed">保存后从当前这堂课开始按此数字计算，之前的课程编号保持不变，后续课程自动递增。</p>
+                <p className="text-[11px] font-bold text-slate-400 leading-relaxed">60分钟＝1课时，90分钟＝1.5课时，120分钟＝2课时。设置从第1课时起算时，两堂120分钟课程会依次显示“累计2课时”“累计4课时”。只影响本堂及以后，之前的累计不变。</p>
+                <p className="text-[12px] font-black text-emerald-700">本堂{formatLessonHours(Number(formData.duration) || 60)}课时 · 本堂结束时累计{formatLessonHours((lessonSettingsDraft.lessonNumber - 1) * 60 + (Number(formData.duration) || 60))}课时</p>
               </div>
 
               {lessonSettingsStatus && <div className="text-center text-[12px] font-black text-emerald-600 bg-emerald-50 rounded-xl py-2 border border-emerald-100">{lessonSettingsStatus}</div>}
@@ -2566,11 +2542,11 @@ export default function App() {
             <div className="px-6 py-5 bg-slate-50 border-t border-slate-100 flex flex-col gap-2.5">
               {lessonSettingsDraft.enabled && (
                 <button onClick={() => saveLessonSettingsFromCurrentCourse(1)} className="w-full py-3 rounded-2xl bg-amber-50 text-amber-700 border border-amber-200 font-black hover:bg-amber-100 transition-all flex items-center justify-center gap-2">
-                  <RefreshCw size={15}/> 从当前这堂重置为第1课时
+                  <RefreshCw size={15}/> 从本堂重新累计（第1课时起算）
                 </button>
               )}
               <button onClick={() => saveLessonSettingsFromCurrentCourse()} className={`w-full py-3 rounded-2xl font-black transition-all ${lessonSettingsDraft.enabled ? 'bg-emerald-600 text-white hover:bg-emerald-700 shadow-lg shadow-emerald-100' : 'bg-slate-700 text-white hover:bg-slate-800'}`}>
-                {lessonSettingsDraft.enabled ? `保存：当前为第${lessonSettingsDraft.lessonNumber}课时` : '保存并关闭课时编号'}
+                {lessonSettingsDraft.enabled ? `保存：从第${lessonSettingsDraft.lessonNumber}课时起算` : '保存并关闭课时累计'}
               </button>
             </div>
           </div>

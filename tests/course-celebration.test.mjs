@@ -24,7 +24,8 @@ const createSave = ({ tag = 'P', recurrence = 'temp', editing = false, fail = fa
     writeBatch: () => ({ set() {}, update() {}, inheritBinding() {}, bindCourse() {}, async commit() { if (delay) await delay; if (fail) throw new Error('offline'); writes++; } }),
     logFirestoreError() {}, setTimeout() {}, console: { info() {} },
   });
-  vm.runInContext(saveHandler + '\nglobalThis.save = handleSave;', context);
+  vm.runInContext(source.slice(source.indexOf('const getLessonTrackingKey ='), source.indexOf('const isCourseInactive ='))
+    + saveHandler + '\nglobalThis.save = handleSave;', context);
   return { save: context.save, celebrations, get writes() { return writes; } };
 };
 

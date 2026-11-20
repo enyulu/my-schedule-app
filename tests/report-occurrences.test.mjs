@@ -12,6 +12,15 @@ vm.runInContext(source.slice(source.indexOf('const getMonday ='), source.indexOf
 const collect = context.collect;
 const base = { id: 'one', title: 'Jayden', colIndex: 0, startTime: '09:00', endTime: '10:30', price: 400, category: 'P', isFixed: false, weekId: '2026-10-26' };
 
+test('stored hourly rate is authoritative regardless of learner name or legacy dates', () => {
+  for (const title of ['David 商务', '芮彤数学', 'Jayden']) {
+    const row = { ...base, title, startTime: '09:00', endTime: '11:00', price: 500, weekId: '2026-04-27' };
+    assert.equal(collect([row], { start: '2026-04-27', end: '2026-04-27' }, new Date(2026, 3, 28))[0].fee, 1000);
+    row.weekId = '2026-11-16';
+    assert.equal(collect([row], { start: '2026-11-16', end: '2026-11-16' }, new Date(2026, 10, 17))[0].fee, 1000);
+  }
+});
+
 test('report occurrences reuse existing fee calculation and completion cutoff', () => {
   const result = collect([base, { ...base, id: 'future', colIndex: 2 }], { start: '2026-10-26', end: '2026-10-31' }, new Date(2026, 9, 26, 12));
   assert.equal(result.length, 1);
